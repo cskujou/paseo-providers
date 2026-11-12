@@ -40,6 +40,7 @@ const capabilities = [
   "session.configure",
   "session.list",
   "session.persistence",
+  "session.subsession",
   "session.revert.both",
   "session.revert.conversation",
   "session.revert.files",
@@ -317,7 +318,7 @@ function createConnection(
         emit({ type: "request.completed", requestId: input.requestId });
         return;
       case "session.permission":
-        session.answerPermission(input.permissionId, input.response);
+        await session.answerPermission(input.permissionId, input.response);
         return;
       case "session.revert":
         await session.revert(input.token, input.scope);

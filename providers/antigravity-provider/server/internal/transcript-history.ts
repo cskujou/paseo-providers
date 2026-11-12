@@ -8,6 +8,28 @@ import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { resolveTranscriptDir } from "./rewind.js";
 import { acpToolToTimelineItem, type AcpToolCallState } from "./timeline.js";
 
+const childSchema = z.object({
+  conversationId: z.string().uuid(),
+  workspaceUris: z.array(z.string()).optional(),
+});
+export function parseSubagentResult(
+  text: string,
+): z.infer<typeof childSchema> | null {
+  const marker = text.indexOf("Created the following subagent:");
+  if (marker < 0) return null;
+  const body = text.slice(marker);
+  const start = body.indexOf("{");
+  const end = body.indexOf("\n}", start);
+  if (start < 0 || end < 0) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(body.slice(start, end + 2));
+  } catch {
+    return null;
+  }
+  const parsed = childSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
 const MAX_TEXT_UNITS = 64 * 1024;
 const transcriptRecordSchema = z.object({
   step_index: z.number().int().nonnegative().optional(),
@@ -72,6 +94,7 @@ export async function readTranscriptTimeline(
   if (!file) return [];
   const items: TranscriptTimelineItem[] = [];
   const pending: PendingTool[] = [];
+  const backgroundTools = new Map<string, PendingTool>();
   for await (const record of readTranscriptRecords(file.path)) {
     const stepIndex = record.step_index ?? items.length;
     const timestamp =
@@ -82,6 +105,7 @@ export async function readTranscriptTimeline(
     if (type === "USER_INPUT" || type === "PLANNER_RESPONSE")
       flushPending(items, pending);
     if (type === "USER_INPUT") {
+      backgroundTools.clear();
       const text = displayUserText(record.content ?? "");
       if (!text) continue;
       const id = "history:" + stepIndex + ":user";
@@ -135,6 +159,31 @@ export async function readTranscriptTimeline(
       }
       continue;
     }
+    if (type === "SYSTEM_MESSAGE") {
+      const text = record.content ?? "";
+      const finishMatch =
+        /Task id "([\w-]+\/task-\d+)" finished with result:/.exec(text);
+      const messageMatch =
+        /\[Message\]\s+timestamp=\S+\s+sender=([\w/-]+)\b/.exec(text);
+      const senderId = finishMatch?.[1] ?? messageMatch?.[1];
+      const bg = senderId ? backgroundTools.get(senderId) : undefined;
+      if (bg) {
+        bg.state.rawOutput = boundText(text);
+        const exit = /Command exited with code (-?\d+)/.exec(text);
+        const exitCode = exit ? Number(exit[1]) : undefined;
+        const item = toolItem(
+          bg.state,
+          exitCode !== undefined && exitCode !== 0 ? "failed" : "completed",
+        );
+        if (item.detail.type === "shell" && exitCode !== undefined)
+          item.detail = { ...item.detail, exitCode };
+        items[bg.index] = {
+          ...item,
+          timestamp: items[bg.index]?.timestamp ?? timestamp,
+        };
+      }
+      continue;
+    }
     const toolIndex =
       type === "GENERIC"
         ? 0
@@ -143,8 +192,16 @@ export async function readTranscriptTimeline(
           );
     if (toolIndex < 0 || pending.length === 0) continue;
     const tool = pending.splice(toolIndex, 1)[0]!;
-    tool.state.rawOutput = boundText(record.content ?? "");
+    const rawText = record.content ?? "";
+    tool.state.rawOutput = boundText(rawText);
     const running = record.status === "RUNNING" || record.status === "PENDING";
+    if (running) {
+      const bgMatch =
+        /Tool is running as a background task with task id:\s*([\w-]+\/task-\d+)/.exec(
+          rawText,
+        );
+      if (bgMatch) backgroundTools.set(bgMatch[1]!, tool);
+    }
     const item =
       live && running
         ? acpToolToTimelineItem(tool.state)
@@ -216,10 +273,12 @@ async function* readTranscriptRecords(filePath: string) {
   }
 }
 
-function matchesToolResult(name: string, type: string): boolean {
+export function matchesToolResult(name: string, type: string): boolean {
+  if (type === "GENERIC") return true;
   if (
     name.toUpperCase() === type ||
-    (name === "list_dir" && type === "LIST_DIRECTORY")
+    (name === "list_dir" && type === "LIST_DIRECTORY") ||
+    (name === "read_file" && type === "VIEW_FILE")
   )
     return true;
   return (

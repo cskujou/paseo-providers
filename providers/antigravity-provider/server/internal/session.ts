@@ -1,6 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { readBackgroundTurn } from "./background.js";
+import { planFromTool, readPendingPlan, type PlanProposal } from "./plan.js";
+import { SubagentTracker } from "./subagents.js";
 import {
   AntigravityError,
   providerError,
@@ -68,6 +71,10 @@ const persistenceDataSchema = z
     mode: z.string().optional(),
     thinkingOption: z.string().optional(),
     settings: z.record(z.string(), z.string()).optional(),
+    resolvedPlanRevision: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
   })
   .refine((d) => Boolean(d.conversationId || d.sessionId), {
     message: "Expected conversationId or sessionId in Antigravity persistence",
@@ -81,6 +88,7 @@ export function parsePersistenceConversationId(
   mode?: string;
   thinkingOption?: string;
   settings?: Record<string, string>;
+  resolvedPlanRevision?: string;
 } {
   if (!persistence) return { conversationId: null };
   if (persistence.version !== 1)
@@ -101,6 +109,7 @@ export function parsePersistenceConversationId(
     mode: parsed.data.mode,
     thinkingOption: parsed.data.thinkingOption,
     settings: parsed.data.settings,
+    resolvedPlanRevision: parsed.data.resolvedPlanRevision,
   };
 }
 
@@ -112,6 +121,7 @@ interface ActiveTurn {
   activity: ReturnType<typeof Promise.withResolvers<void>>;
   backgroundPhase?: string;
   backgroundAfterStep?: number;
+  plan?: PlanProposal;
 }
 
 type ProviderRevertScope = Extract<
@@ -163,10 +173,16 @@ export class Session {
   private configOptions: AcpConfigOption[] = [];
   private configuring = false;
   private hasDaemonTasks = false;
+  private subagents: SubagentTracker | null = null;
+  private readonly linkedSubagentCalls = new Set<string>();
+  private subagentWatch: Promise<void> | null = null;
+  private planApproval: { id: string; plan: PlanProposal } | null = null;
+  private resolvedPlanRevision?: string;
 
   constructor(private readonly options: SessionOptions) {
     const saved = parsePersistenceConversationId(options.persistence);
     this.conversationId = saved.conversationId;
+    this.resolvedPlanRevision = saved.resolvedPlanRevision;
     this.sessionCatalog = options.catalog();
     this.config = {
       ...options.config,
@@ -232,6 +248,12 @@ export class Session {
       this.emitItem(item);
     }
     this.bufferedReplayItems.length = 0;
+    await this.subagentTracker().refresh();
+    if (this.subagents?.running) this.watchSubagents();
+    if (this.config.mode === "plan" && this.conversationId) {
+      const plan = await readPendingPlan(this.conversationId, this.mergedEnv);
+      if (plan) this.publishPlanApproval(plan);
+    }
 
     if (this.config.persist && this.conversationId) {
       this.emit({
@@ -264,7 +286,9 @@ export class Session {
       !this.configuring &&
       !this.hasRunningTools() &&
       !this.hasDaemonTasks &&
-      this.pendingPermissions.size === 0
+      !this.subagents?.running &&
+      this.pendingPermissions.size === 0 &&
+      this.planApproval === null
     );
   }
 
@@ -291,6 +315,7 @@ export class Session {
         "STEER_UNSUPPORTED",
       );
     }
+    this.dismissPlanApproval("canceled", true);
     const admission = new AbortController();
     this.pendingPrompt = admission;
     let turn: ActiveTurn;
@@ -336,6 +361,7 @@ export class Session {
       this.messages.clear();
       for (const id of this.toolCalls.keys()) this.retiredToolCalls.add(id);
       this.toolCalls.clear();
+      this.linkedSubagentCalls.clear();
       this.fallbackChunkIds.clear();
       this.pendingPrompt = null;
       this.emit({
@@ -358,6 +384,7 @@ export class Session {
         text: displayText,
         revertToken,
       });
+      let completed = false;
       try {
         const response = z
           .object({
@@ -395,6 +422,7 @@ export class Session {
         if (!canceled) {
           await this.waitForBackgroundTurn(turn);
           await this.waitForTurnTools(turn);
+          await this.waitForSubagents(turn);
         }
         if (this.activeTurn !== turn) return;
         if (turn.canceled || canceled) {
@@ -402,6 +430,11 @@ export class Session {
           if (this.activeTurn !== turn) return;
           this.finishRunningTools("canceled");
         }
+        if (!turn.canceled && !canceled && this.config.mode === "plan")
+          turn.plan ??=
+            (await readPendingPlan(this.conversationId, this.mergedEnv)) ??
+            undefined;
+        completed = !turn.canceled && !canceled;
         logDiagnostic("turn.settled", {
           sessionId: this.options.id,
           conversationId: this.conversationId,
@@ -451,6 +484,13 @@ export class Session {
           });
         turn.activity.resolve();
         turn.resolve();
+        if (
+          completed &&
+          turn.plan &&
+          this.config.mode === "plan" &&
+          !this.closed
+        )
+          this.publishPlanApproval(turn.plan);
       }
     } finally {
       if (this.pendingPrompt === admission) this.pendingPrompt = null;
@@ -526,17 +566,25 @@ export class Session {
         });
       }
       for (const task of snapshot.tasks) {
-        if (!task.completed && !task.daemon) continue;
+        if (task.kind === "subagent" || (!task.completed && !task.daemon))
+          continue;
         for (const [id, state] of this.toolCalls) {
           const input = state.rawInput;
-          if (
-            state.name !== "run_command" ||
-            !input ||
-            typeof input !== "object" ||
-            Array.isArray(input) ||
-            input.CommandLine !== task.command
-          )
-            continue;
+          const matchesRunCommand =
+            task.toolName !== "schedule" &&
+            state.name === "run_command" &&
+            input &&
+            typeof input === "object" &&
+            !Array.isArray(input) &&
+            input.CommandLine === task.command;
+          const matchesSchedule =
+            task.toolName === "schedule" &&
+            state.name === "schedule" &&
+            input &&
+            typeof input === "object" &&
+            !Array.isArray(input) &&
+            (input.Prompt === task.prompt || input.Prompt === task.command);
+          if (!matchesRunCommand && !matchesSchedule) continue;
           const next = {
             ...state,
             status:
@@ -650,6 +698,83 @@ export class Session {
     return true;
   }
 
+  private subagentTracker(): SubagentTracker {
+    if (this.subagents) return this.subagents;
+    if (!this.conversationId)
+      throw new AntigravityError(
+        "Missing conversation for subagent history",
+        "NO_CONVERSATION",
+      );
+    this.subagents = new SubagentTracker({
+      id: this.options.id,
+      conversationId: this.conversationId,
+      cwd: this.config.cwd,
+      env: this.mergedEnv,
+      emit: (event) => this.emit(event),
+      resolveCallId: (callId, args) => {
+        const state = [...this.toolCalls.values()].find(
+          (tool) =>
+            tool.name === "invoke_subagent" &&
+            !this.linkedSubagentCalls.has(tool.toolCallId) &&
+            isDeepStrictEqual(tool.rawInput, args),
+        );
+        if (!state || !this.activeTurn) return callId;
+        this.linkedSubagentCalls.add(state.toolCallId);
+        const scoped = this.activeTurn.id + ":" + state.toolCallId;
+        return scoped;
+      },
+    });
+    return this.subagents;
+  }
+
+  private watchSubagents(): void {
+    if (this.subagentWatch) return;
+    const tracker = this.subagentTracker();
+    this.subagentWatch = (async () => {
+      while (
+        !this.closed &&
+        !this.restarting &&
+        this.subagents === tracker &&
+        this.client &&
+        (this.activeTurn || tracker.running)
+      ) {
+        await tracker.refresh();
+        await delay(250);
+      }
+    })()
+      .catch((error) => {
+        logDiagnostic(
+          "subagent.history_failed",
+          { sessionId: this.options.id, conversationId: this.conversationId },
+          error,
+        );
+        this.emit({
+          type: "session.notice",
+          sessionId: this.options.id,
+          notice: {
+            id: "subagent-history",
+            severity: "error",
+            title: "Could not refresh Antigravity subagent history",
+            description: providerError(error).message,
+          },
+        });
+      })
+      .finally(() => {
+        this.subagentWatch = null;
+      });
+  }
+
+  private async waitForSubagents(turn: ActiveTurn): Promise<void> {
+    const tracker = this.subagentTracker();
+    await tracker.refresh();
+    while (this.activeTurn === turn && !turn.canceled && tracker.running) {
+      await Promise.race([delay(250), turn.activity.promise]);
+      if (this.activeTurn !== turn || turn.canceled) return;
+      turn.activity = Promise.withResolvers<void>();
+      await tracker.refresh();
+    }
+  }
+
   private async waitForTurnTools(turn: ActiveTurn): Promise<void> {
     while (
       this.activeTurn === turn &&
@@ -672,6 +797,7 @@ export class Session {
   private async stopCanceledClient(client: AcpClient): Promise<void> {
     // Canceling after the ACP prompt response must also stop its background work.
     await client.close();
+    this.subagents?.finish("canceled");
     if (this.client === client) {
       this.client = null;
       this.hasDaemonTasks = false;
@@ -757,10 +883,142 @@ export class Session {
     }
   }
 
-  answerPermission(
+  private publishPlanApproval(plan: PlanProposal): void {
+    const revision = createHash("sha256").update(plan.text).digest("hex");
+    if (
+      revision === this.resolvedPlanRevision ||
+      this.planApproval?.plan.text === plan.text
+    )
+      return;
+    this.dismissPlanApproval();
+    const id = "plan-approval:" + randomUUID();
+    this.planApproval = { id, plan };
+    this.emitItem({
+      type: "tool_call",
+      id,
+      callId: id,
+      name: "plan_approval",
+      status: "running",
+      error: null,
+      detail: { type: "plan", text: plan.text },
+    });
+    this.emit({
+      type: "session.permission",
+      sessionId: this.options.id,
+      request: {
+        id,
+        name: "AntigravityPlanApproval",
+        kind: "plan",
+        title: "Implementation plan",
+        description: plan.summary,
+        input: { plan: plan.text },
+        detail: { type: "plan", text: plan.text },
+        metadata: {
+          planText: plan.text,
+          source: "antigravity_artifact_feedback",
+        },
+        actions: [
+          {
+            id: "implement",
+            label: "Approve and implement",
+            behavior: "allow",
+            variant: "primary",
+            intent: "implement",
+          },
+          {
+            id: "dismiss",
+            label: "Keep planning",
+            behavior: "deny",
+            variant: "secondary",
+            intent: "dismiss",
+          },
+        ],
+      },
+    });
+  }
+
+  private dismissPlanApproval(
+    status: "completed" | "canceled" = "canceled",
+    resolved = false,
+  ): void {
+    const approval = this.planApproval;
+    if (!approval) return;
+    this.planApproval = null;
+    if (resolved) {
+      this.resolvedPlanRevision = createHash("sha256")
+        .update(approval.plan.text)
+        .digest("hex");
+      this.publishPersistence();
+    }
+    this.emitItem({
+      type: "tool_call",
+      id: approval.id,
+      callId: approval.id,
+      name: "plan_approval",
+      status,
+      error: null,
+      detail: { type: "plan", text: approval.plan.text },
+    });
+    this.emit({
+      type: "session.permission_resolved",
+      sessionId: this.options.id,
+      permissionId: approval.id,
+    });
+  }
+
+  async answerPermission(
     permissionId: string,
     response: ProviderPermissionResponse,
-  ): void {
+  ): Promise<void> {
+    const approval = this.planApproval;
+    if (approval?.id === permissionId) {
+      const expected = response.behavior === "allow" ? "implement" : "dismiss";
+      if (response.selectedActionId && response.selectedActionId !== expected)
+        throw new AntigravityError(
+          "Invalid plan approval action",
+          "INVALID_PERMISSION_ACTION",
+        );
+      if (response.behavior === "deny") {
+        this.dismissPlanApproval("canceled", true);
+        return;
+      }
+      // Do not publish approval success until the native session accepts leaving plan mode.
+      await this.configure({ mode: "default" });
+      if (this.planApproval !== approval || this.closed)
+        throw new AntigravityError(
+          "Plan approval was superseded",
+          "PLAN_SUPERSEDED",
+        );
+      this.dismissPlanApproval("completed", true);
+      const prompt: ProviderPrompt = {
+        clientMessageId: randomUUID(),
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [
+            {
+              type: "text",
+              text:
+                "The user approved this implementation plan. Implement it and run its verification steps.\n\n" +
+                approval.plan.text,
+            },
+          ],
+        },
+      };
+      void this.prompt(prompt).catch((error) => {
+        logDiagnostic(
+          "plan.implementation_failed",
+          { sessionId: this.options.id, conversationId: this.conversationId },
+          error,
+        );
+        this.emit({
+          type: "session.runtime_failed",
+          sessionId: this.options.id,
+          error: providerError(error),
+        });
+      });
+      return;
+    }
     const pending = this.pendingPermissions.get(permissionId);
     if (!pending) {
       throw new AntigravityError(
@@ -850,8 +1108,12 @@ export class Session {
       );
     if (scope !== "conversation")
       await this.rewindTracker.assertFileCheckpoint(token);
+    this.dismissPlanApproval();
     this.restarting = true;
+    this.subagents?.finish("canceled");
+    this.subagents = null;
     try {
+      await this.subagentWatch;
       if (this.activeTurn) await this.interrupt();
       if (this.client) {
         const client = this.client;
@@ -928,6 +1190,8 @@ export class Session {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    this.dismissPlanApproval();
+    this.subagents?.finish("canceled");
     this.closed = true;
     logDiagnostic("session.close_requested", {
       sessionId: this.options.id,
@@ -1135,6 +1399,8 @@ export class Session {
           "Antigravity session closed during startup",
           "SESSION_CLOSED",
         );
+      await this.subagentWatch;
+      await this.subagents?.resume();
       return client;
     } catch (error) {
       await client.close();
@@ -1418,6 +1684,10 @@ export class Session {
       if (merged.kind === "execute" || merged.name === "run_command")
         await this.rewindTracker.recordShellOperation();
       this.toolCalls.set(merged.toolCallId, merged);
+      if (this.activeTurn && this.config.mode === "plan" && this.conversationId)
+        this.activeTurn.plan =
+          planFromTool(merged, this.conversationId, this.mergedEnv) ??
+          this.activeTurn.plan;
       this.activeTurn?.activity.resolve();
 
       if (merged.status === "pending" || merged.status === "in_progress") {
@@ -1431,6 +1701,12 @@ export class Session {
 
       const item = acpToolToTimelineItem(merged);
       this.recordOrEmitTimelineItem(item);
+      if (
+        merged.name === "invoke_subagent" &&
+        this.opened &&
+        this.replayMode === "none"
+      )
+        this.watchSubagents();
       return;
     }
 
@@ -1679,6 +1955,7 @@ export class Session {
     );
     this.client = null;
     this.hasDaemonTasks = false;
+    this.subagents?.finish("failed");
     this.cancelPendingPermissions();
     if (this.activeTurn) {
       const turnId = this.activeTurn.id;
@@ -1810,6 +2087,9 @@ export class Session {
       data: {
         conversationId: this.conversationId,
         sessionId: this.conversationId,
+        ...(this.resolvedPlanRevision
+          ? { resolvedPlanRevision: this.resolvedPlanRevision }
+          : {}),
         model: selection.baseModel,
         mode: selection.mode,
         settings: Object.fromEntries(

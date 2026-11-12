@@ -1,7 +1,9 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   AntigravityUsage,
   parsePtyUsageOutput,
@@ -27,6 +29,79 @@ describe("Antigravity quota", () => {
     ]);
     expect(parsed.windows[0]?.resetsAt).toBe("2026-01-01T01:30:00.000Z");
   });
+  it("runs quota collection in the account home rather than inheriting the daemon project", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "agy-quota-home-"));
+    dirs.push(home);
+    const usage = new AntigravityUsage();
+    usage.remember({
+      command: process.execPath,
+      args: [
+        fileURLToPath(new URL("./fixtures/quota-cli.mjs", import.meta.url)),
+      ],
+      env: { HOME: home },
+    });
+    try {
+      const report = await usage.registration().fetch({ home });
+      expect(report.status).toBe("available");
+      if (report.status !== "available")
+        throw new Error("Quota collection failed");
+      expect(report.windows.map((window) => window.remainingPct)).toEqual([
+        80, 60, 40, 20,
+      ]);
+      expect(await readFile(path.join(home, "quota-cwd.txt"), "utf8")).toBe(
+        home,
+      );
+      expect(
+        await readFile(path.join(home, "quota-input.txt"), "utf8"),
+      ).toContain("/usage\r");
+    } finally {
+      await usage.close();
+    }
+  });
+  it("reports workspace trust as its own failure and does not automatically trust a directory", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "agy-quota-trust-"));
+    dirs.push(home);
+    const usage = new AntigravityUsage();
+    usage.remember({
+      command: process.execPath,
+      args: [
+        fileURLToPath(new URL("./fixtures/quota-cli.mjs", import.meta.url)),
+      ],
+      env: { HOME: home, QUOTA_FIXTURE_TRUST: "1" },
+    });
+    try {
+      const report = await usage.registration().fetch({ home });
+      expect(report).toMatchObject({
+        status: "error",
+        error: expect.stringContaining("trust approval"),
+      });
+      expect(existsSync(path.join(home, "quota-input.txt"))).toBe(false);
+    } finally {
+      await usage.close();
+    }
+  });
+
+  it("reports unknown quota format separately from CLI startup and trust failures", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "agy-quota-format-"));
+    dirs.push(home);
+    const usage = new AntigravityUsage();
+    usage.remember({
+      command: process.execPath,
+      args: [
+        fileURLToPath(new URL("./fixtures/quota-cli.mjs", import.meta.url)),
+      ],
+      env: { HOME: home, QUOTA_FIXTURE_UNKNOWN: "1" },
+    });
+    try {
+      expect(await usage.registration().fetch({ home })).toMatchObject({
+        status: "error",
+        error: expect.stringContaining("output format may have changed"),
+      });
+    } finally {
+      await usage.close();
+    }
+  });
+
   it("reports a failed probe rather than serving old quota as available", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "agy-usage-test-"));
     dirs.push(home);
@@ -48,7 +123,10 @@ describe("Antigravity quota", () => {
       env: { HOME: home },
     });
     try {
-      expect((await usage.registration().fetch({ home })).status).toBe("error");
+      expect(await usage.registration().fetch({ home })).toMatchObject({
+        status: "error",
+        error: expect.stringContaining("did not reach the /usage prompt"),
+      });
     } finally {
       await usage.close();
     }

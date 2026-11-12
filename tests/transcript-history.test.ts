@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -169,6 +169,64 @@ describe("local transcript metadata and replay", () => {
     });
   });
 
+  it.each(["run_command", "schedule"])(
+    "settles a transcript-only %s result on its native completion message",
+    async (name) => {
+      const args =
+        name === "schedule"
+          ? { Prompt: "Check progress", DurationSeconds: 60 }
+          : { CommandLine: "npm test" };
+      const { env, logs } = await transcript([
+        { type: "USER_INPUT", step_index: 0, content: "start" },
+        {
+          type: "PLANNER_RESPONSE",
+          step_index: 1,
+          tool_calls: [{ name, args }],
+        },
+        {
+          type: "GENERIC",
+          step_index: 2,
+          status: "RUNNING",
+          content:
+            "Tool is running as a background task with task id: fixture/task-2",
+        },
+        {
+          type: "PLANNER_RESPONSE",
+          step_index: 3,
+          status: "DONE",
+          content: "waiting",
+        },
+      ]);
+      const before = (await readTranscriptTimeline("fixture", env, true)).find(
+        (item) => item.type === "tool_call",
+      );
+      expect(before?.status).toBe("running");
+      const message =
+        name === "schedule"
+          ? "[Message] timestamp=2026-11-12T15:13:58Z sender=fixture/task-2 priority=MESSAGE_PRIORITY_HIGH content=Check progress"
+          : 'Task id "fixture/task-2" finished with result:\nCommand exited with code 1.';
+      const file = path.join(logs, "transcript_full.jsonl");
+      const records = await readFile(file, "utf8");
+      await writeFile(
+        file,
+        records +
+          "\n" +
+          JSON.stringify({
+            type: "SYSTEM_MESSAGE",
+            step_index: 4,
+            status: "DONE",
+            content: message,
+          }),
+      );
+      const after = (await readTranscriptTimeline("fixture", env, true)).find(
+        (item) => item.type === "tool_call",
+      );
+      expect(after?.id).toBe(before?.id);
+      expect(after?.status).toBe(name === "schedule" ? "completed" : "failed");
+      if (name === "run_command")
+        expect(after?.detail).toMatchObject({ type: "shell", exitCode: 1 });
+    },
+  );
   it("never follows a conversation id outside the transcript root", async () => {
     const { env } = await transcript([]);
     await expect(readTranscriptSummary("../outside", env)).rejects.toThrow(

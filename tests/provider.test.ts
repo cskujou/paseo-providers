@@ -30,6 +30,7 @@ async function harness(env: Record<string, string> = {}) {
       "session.configure",
       "session.list",
       "session.persistence",
+      "session.subsession",
       "session.revert.both",
       "session.revert.files",
       "session.revert.conversation",
@@ -1002,6 +1003,405 @@ describe("Antigravity provider public contract", () => {
         .filter((e) => e.item.type === "assistant_message")
         .at(-1)?.item,
     ).toMatchObject({ text: "LATE_BACKGROUND_DONE" });
+  });
+
+  it("settles a schedule wakeup without leaving the foreground tool-drain deadlocked", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("timer", "schedule-held");
+    await h.wait(
+      "session.notice",
+      (e) => e.notice.title === "Background task is running",
+    );
+    const file = path.join(
+      h.cwd,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "fixture",
+      ".system_generated",
+      "logs",
+      "transcript_full.jsonl",
+    );
+    const records = await readFile(file, "utf8");
+    const wake =
+      records +
+      JSON.stringify({
+        type: "SYSTEM_MESSAGE",
+        step_index: 4,
+        status: "DONE",
+        content:
+          "[Message] timestamp=2026-11-12T15:13:58Z sender=fixture/task-2 priority=MESSAGE_PRIORITY_HIGH content=Check progress",
+      }) +
+      "\n";
+    await writeFile(file, wake);
+    await h.wait(
+      "timeline.item",
+      (e) =>
+        e.item.type === "tool_call" &&
+        e.item.name === "schedule" &&
+        e.item.status === "completed",
+    );
+    expect(
+      h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+    ).toEqual(["started"]);
+    await writeFile(
+      file,
+      wake +
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 5,
+          status: "DONE",
+          content: "TIMER_DONE",
+        }) +
+        "\n",
+    );
+    await h.wait("session.turn", (e) => e.state === "completed");
+    expect(
+      h.events
+        .filter((e) => e.type === "timeline.item")
+        .filter((e) => e.item.type === "assistant_message")
+        .at(-1)?.item,
+    ).toMatchObject({ text: "TIMER_DONE" });
+    await h.prompt("next", "next");
+    await h.wait(
+      "session.prompt_result",
+      (e) => e.clientMessageId === "next" && e.result.type === "turn",
+    );
+  });
+  it("renders a feedback-requested plan and approves implementation through the native mode change", async () => {
+    const h = await harness();
+    await h.open({
+      config: {
+        cwd: h.cwd,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+        mode: "plan",
+      },
+    });
+    await h.prompt("plan", "plan-proposal");
+    const first = await h.wait("session.turn", (e) => e.state === "completed");
+    const request = await h.wait(
+      "session.permission",
+      (e) => e.request.kind === "plan",
+    );
+    expect(request.request).toMatchObject({
+      kind: "plan",
+      input: { plan: expect.stringContaining("Implementation plan") },
+      metadata: { source: "antigravity_artifact_feedback" },
+    });
+    expect(request.request.actions?.map((a) => a.intent)).toEqual([
+      "implement",
+      "dismiss",
+    ]);
+    expect(
+      h.events
+        .filter((e) => e.type === "timeline.item")
+        .some(
+          (e) => e.item.type === "tool_call" && e.item.detail.type === "plan",
+        ),
+    ).toBe(true);
+    await h.connection.send({
+      type: "session.permission",
+      sessionId: "s",
+      permissionId: request.request.id,
+      response: { behavior: "allow", selectedActionId: "implement" },
+    });
+    await h.wait(
+      "session.permission_resolved",
+      (e) => e.permissionId === request.request.id,
+    );
+    await h.wait(
+      "session.turn",
+      (e) => e.state === "completed" && e.turnId !== first.turnId,
+    );
+    expect(
+      h.events.filter((e) => e.type === "session.config").at(-1)?.config.mode,
+    ).toBe("default");
+    expect(
+      h.events
+        .filter((e) => e.type === "timeline.item")
+        .filter((e) => e.item.type === "user_message")
+        .at(-1)?.item,
+    ).toMatchObject({
+      text: expect.stringContaining("user approved this implementation plan"),
+    });
+  });
+  it("denies a plan without starting implementation and dismisses stale proposals on a new prompt", async () => {
+    const h = await harness();
+    await h.open({
+      config: {
+        cwd: h.cwd,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: false,
+        mode: "plan",
+      },
+    });
+    await h.prompt("plan", "plan-proposal");
+    const approval = await h.wait(
+      "session.permission",
+      (e) => e.request.kind === "plan",
+    );
+    await h.connection.send({
+      type: "session.permission",
+      sessionId: "s",
+      permissionId: approval.request.id,
+      response: { behavior: "deny", selectedActionId: "dismiss" },
+    });
+    await h.wait(
+      "session.permission_resolved",
+      (e) => e.permissionId === approval.request.id,
+    );
+    expect(
+      h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+    ).toEqual(["started", "completed"]);
+    expect(
+      h.events.filter((e) => e.type === "session.config").at(-1)?.config.mode,
+    ).toBe("plan");
+    await h.prompt("next", "ordinary-artifact");
+    await h.wait("session.prompt_result", (e) => e.clientMessageId === "next");
+    const prior = h.events
+      .filter((e) => e.type === "session.turn")
+      .find((e) => e.state === "completed")!;
+    await h.wait(
+      "session.turn",
+      (e) => e.state === "completed" && e.turnId !== prior.turnId,
+    );
+    expect(
+      h.events.filter(
+        (e) => e.type === "session.permission" && e.request.kind === "plan",
+      ),
+    ).toHaveLength(1);
+  });
+  it("keeps the plan pending when native implementation mode is rejected", async () => {
+    const h = await harness({ FIXTURE_REJECT_IMPLEMENT: "1" });
+    await h.open({
+      config: {
+        cwd: h.cwd,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+        mode: "plan",
+      },
+    });
+    await h.prompt("plan", "plan-proposal");
+    const approval = await h.wait(
+      "session.permission",
+      (e) => e.request.kind === "plan",
+    );
+    await h.connection.send({
+      type: "session.permission",
+      sessionId: "s",
+      permissionId: approval.request.id,
+      response: { behavior: "allow", selectedActionId: "implement" },
+    });
+    const failure = await h.wait("session.runtime_failed");
+    expect(failure.error.message).toBe("implementation mode rejected");
+    expect(
+      h.events.filter((e) => e.type === "session.permission_resolved"),
+    ).toHaveLength(0);
+    expect(
+      h.events.filter((e) => e.type === "session.config").at(-1)?.config.mode,
+    ).toBe("plan");
+    expect(
+      h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+    ).toEqual(["started", "completed"]);
+  });
+  it.each([false, true])(
+    "restores pending plans but does not reopen rejected plans (rejected=%s)",
+    async (rejected) => {
+      const h = await harness({ FIXTURE_EMPTY_LOAD: "1" });
+      await h.open({
+        config: {
+          cwd: h.cwd,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+          mode: "plan",
+        },
+      });
+      await h.prompt("plan", "plan-proposal");
+      const approval = await h.wait(
+        "session.permission",
+        (e) => e.request.kind === "plan",
+      );
+      if (rejected) {
+        await h.connection.send({
+          type: "session.permission",
+          sessionId: "s",
+          permissionId: approval.request.id,
+          response: { behavior: "deny", selectedActionId: "dismiss" },
+        });
+        await h.wait(
+          "session.permission_resolved",
+          (e) => e.permissionId === approval.request.id,
+        );
+      }
+      const persistence = h.events
+        .filter((e) => e.type === "session.persistence")
+        .at(-1)!.persistence;
+      await h.connection.send({
+        type: "session.close",
+        sessionId: "s",
+        requestId: "close-plan",
+      });
+      await h.wait("request.completed", (e) => e.requestId === "close-plan");
+      await h.connection.send({
+        type: "session.open",
+        sessionId: "restored-plan",
+        requestId: "restore-plan",
+        history: "replay",
+        persistence,
+        config: {
+          cwd: h.cwd,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      });
+      await h.wait("session.ready", (e) => e.sessionId === "restored-plan");
+      const restored = h.events
+        .filter((e) => e.type === "session.permission")
+        .filter((e) => e.sessionId === "restored-plan");
+      expect(restored).toHaveLength(rejected ? 0 : 1);
+      if (!rejected) expect(restored[0]?.request.kind).toBe("plan");
+    },
+  );
+  it("publishes real child sessions, tool linkage, independent history and completed lifecycle", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("delegate", "subagent-task");
+    const child = await h.wait(
+      "session.opened",
+      (e) => e.parentSessionId === "s",
+    );
+    expect(child).toMatchObject({
+      sessionId: "agy-child:12345678-1234-4123-8123-123456789abc",
+      restoration: "parent",
+      capabilities: [],
+      title: "File reader",
+    });
+    const linked = h.events
+      .filter((e) => e.type === "timeline.item")
+      .find(
+        (e) =>
+          e.item.type === "tool_call" && e.item.callId === child.toolCallId,
+      );
+    expect(linked?.item).toMatchObject({
+      type: "tool_call",
+      name: "invoke_subagent",
+    });
+    const completed = await h.wait(
+      "session.turn",
+      (e) => e.sessionId === child.sessionId && e.state === "completed",
+    );
+    const root = await h.wait(
+      "session.turn",
+      (e) => e.sessionId === "s" && e.state === "completed",
+    );
+    expect(h.events.indexOf(completed)).toBeLessThan(h.events.indexOf(root));
+    expect(
+      h.events
+        .filter((e) => e.type === "timeline.item")
+        .filter(
+          (e) => e.sessionId === "s" && e.item.type === "assistant_message",
+        )
+        .at(-1)?.item,
+    ).toMatchObject({ text: "PARENT_DONE" });
+    expect(
+      h.events
+        .filter((e) => e.type === "timeline.item")
+        .filter((e) => e.sessionId === child.sessionId)
+        .map((e) => e.item.type),
+    ).toEqual(["reasoning", "tool_call", "tool_call", "assistant_message"]);
+    expect(
+      h.events
+        .filter((e) => e.type === "timeline.item")
+        .filter(
+          (e) =>
+            e.item.type === "tool_call" && e.item.detail.type === "sub_agent",
+        )
+        .at(-1)?.item,
+    ).toMatchObject({
+      status: "completed",
+      detail: {
+        childSessionId: child.sessionId,
+        log: "CHILD_DONE",
+        actions: [{ index: 1, toolName: "read_file", summary: "completed" }],
+      },
+    });
+  });
+
+  it("restores the parent and child histories after importing a local subagent conversation", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("delegate", "subagent-task");
+    await h.wait(
+      "session.turn",
+      (e) => e.sessionId === "s" && e.state === "completed",
+    );
+    await h.connection.send({
+      type: "session.close",
+      sessionId: "s",
+      requestId: "close",
+    });
+    await h.wait("request.completed", (e) => e.requestId === "close");
+    await h.connection.send({
+      type: "session.open",
+      sessionId: "restored",
+      requestId: "restore",
+      history: "replay",
+      persistence: { version: 1, data: { conversationId: "fixture" } },
+      config: {
+        cwd: h.cwd,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    });
+    await h.wait("session.ready", (e) => e.sessionId === "restored");
+    const reopened = h.events
+      .filter((e) => e.type === "session.opened")
+      .filter((e) => e.parentSessionId === "restored");
+    expect(reopened).toHaveLength(1);
+    const childEvents = h.events
+      .slice(h.events.indexOf(reopened[0]!))
+      .filter(
+        (e) =>
+          e.type === "timeline.item" && e.sessionId === reopened[0]!.sessionId,
+      );
+    expect(
+      childEvents.some(
+        (e) =>
+          e.type === "timeline.item" &&
+          e.item.type === "assistant_message" &&
+          e.item.text === "CHILD_DONE",
+      ),
+    ).toBe(true);
+    expect(
+      h.events.some(
+        (e) => e.type === "session.turn" && e.sessionId === "restored",
+      ),
+    ).toBe(false);
+  });
+  it("keeps plan rejection distinct from ordinary file permissions", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("file", "plan-proposal");
+    await h.wait("session.turn", (e) => e.state === "completed");
+    expect(
+      h.events.filter(
+        (e) => e.type === "session.permission" && e.request.kind === "plan",
+      ),
+    ).toEqual([]);
   });
 
   it("does not advertise steering without a native acknowledgement", async () => {

@@ -19,7 +19,7 @@ async function run(mode: string): Promise<unknown> {
   return JSON.parse(result);
 }
 
-describe("compiled provider through the real Paseo 0.14 host", () => {
+describe("compiled provider through the real Paseo host", () => {
   it("preserves import-sheet summaries through schema validation, listing and import", async () => {
     expect(await run("summaries")).toEqual({
       listed: [
@@ -103,6 +103,62 @@ describe("compiled provider through the real Paseo 0.14 host", () => {
     });
   }, 20000);
 
+  it("renders the plan approval and starts implementation after native mode commit", async () => {
+    expect(await run("plan-approval")).toEqual({
+      planKind: "plan",
+      planText: "# Implementation plan\nCreate output.txt and verify it.",
+      mode: "default",
+      turns: [
+        "turn_started",
+        "turn_completed",
+        "turn_started",
+        "turn_completed",
+      ],
+      planCards: ["running", "completed"],
+    });
+  }, 20000);
+  it("preserves child graph, history, linked tool and parent automatic reply", async () => {
+    const result = await run("subagent-lifecycle");
+    if (
+      !result ||
+      typeof result !== "object" ||
+      !("updates" in result) ||
+      !Array.isArray(result.updates)
+    )
+      throw new Error("Missing child updates");
+    expect(result.updates[0]).toEqual({
+      id: "agy-child:12345678-1234-4123-8123-123456789abc",
+      parent: null,
+      status: "running",
+      hasToolLink: true,
+    });
+    expect(result.updates.at(-1)).toEqual({
+      id: "agy-child:12345678-1234-4123-8123-123456789abc",
+      status: "completed",
+      hasToolLink: false,
+    });
+    expect(
+      result.updates.filter((update) => update.status === "completed"),
+    ).toHaveLength(1);
+    expect(
+      result.updates.every(
+        (update) =>
+          update.id === "agy-child:12345678-1234-4123-8123-123456789abc" &&
+          ["running", "completed"].includes(update.status),
+      ),
+    ).toBe(true);
+    expect(result).toMatchObject({
+      childTimeline: [
+        "reasoning",
+        "tool_call",
+        "tool_call",
+        "assistant_message",
+      ],
+      hasLinkedCard: true,
+      historyEvents: 6,
+      parentFinalText: "PARENT_DONE",
+    });
+  }, 20000);
   it("keeps description-only previews working for other plugin providers", async () => {
     expect(await run("legacy")).toEqual([
       { firstPromptPreview: null, lastPromptPreview: "old-style preview" },

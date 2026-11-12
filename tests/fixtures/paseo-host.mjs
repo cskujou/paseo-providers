@@ -66,7 +66,11 @@ try {
       mode: "replace",
       argv: [process.execPath, path.join(repo, "tests", "fixtures", "agy.mjs")],
     },
-    env: { HOME: temporary, FIXTURE_EMPTY_LOAD: "1", FIXTURE_REJECT_PLAN: "1" },
+    env: {
+      HOME: temporary,
+      FIXTURE_EMPTY_LOAD: "1",
+      FIXTURE_REJECT_PLAN: process.argv[2] === "plan-approval" ? "0" : "1",
+    },
   });
   const mode = process.argv[2];
   if (mode === "summaries") {
@@ -338,6 +342,100 @@ try {
         followUpSucceeded: result.finalText.includes("next"),
       }),
     );
+    await session.close();
+  } else if (mode === "plan-approval") {
+    const session = await client.createSession(
+      {
+        provider: "antigravity",
+        cwd: temporary,
+        mcpServers: {},
+        modeId: "plan",
+      },
+      undefined,
+      { persistSession: true },
+    );
+    const events = [];
+    const approvalReady = Promise.withResolvers();
+    const implemented = Promise.withResolvers();
+    let planId;
+    const unsubscribe = session.subscribe((event) => {
+      events.push(event);
+      if (
+        event.type === "permission_requested" &&
+        event.request.kind === "plan"
+      ) {
+        planId = event.request.id;
+        approvalReady.resolve(event.request);
+      }
+      if (
+        planId &&
+        event.type === "turn_completed" &&
+        events.filter((e) => e.type === "turn_completed").length === 2
+      )
+        implemented.resolve();
+    });
+    await session.run("plan-proposal");
+    const approval = await approvalReady.promise;
+    await session.respondToPermission(approval.id, {
+      behavior: "allow",
+      selectedActionId: "implement",
+    });
+    await implemented.promise;
+    console.log(
+      JSON.stringify({
+        planKind: approval.kind,
+        planText: approval.metadata.planText,
+        mode: (await session.getRuntimeInfo()).modeId,
+        turns: events
+          .filter((e) => e.type.startsWith("turn_"))
+          .map((e) => e.type),
+        planCards: events
+          .filter(
+            (e) =>
+              e.type === "timeline" &&
+              e.item.type === "tool_call" &&
+              e.item.detail.type === "plan",
+          )
+          .map((e) => e.item.status),
+      }),
+    );
+    unsubscribe();
+    await session.close();
+  } else if (mode === "subagent-lifecycle") {
+    const session = await client.createSession(
+      { provider: "antigravity", cwd: temporary, mcpServers: {} },
+      undefined,
+      { persistSession: true },
+    );
+    const events = [];
+    const unsubscribe = session.subscribe((event) => events.push(event));
+    const result = await session.run("subagent-task");
+    const subagent = events.filter((e) => e.type === "provider_subagent");
+    console.log(
+      JSON.stringify({
+        updates: subagent
+          .filter((e) => e.event.type === "upsert")
+          .map((e) => ({
+            id: e.event.id,
+            parent: e.event.parentSubagentId,
+            status: e.event.status,
+            hasToolLink: !!e.event.toolCallId,
+          })),
+        childTimeline: subagent
+          .filter((e) => e.event.type === "timeline")
+          .map((e) => e.event.item.type),
+        hasLinkedCard: events.some(
+          (e) =>
+            e.type === "timeline" &&
+            e.item.type === "tool_call" &&
+            e.item.detail.type === "sub_agent" &&
+            !!e.item.detail.childSessionId,
+        ),
+        historyEvents: session.subagentHistory().length,
+        parentFinalText: result.finalText,
+      }),
+    );
+    unsubscribe();
     await session.close();
   } else if (mode === "legacy") {
     // Other plugins still use description; the summary patch must not break them.

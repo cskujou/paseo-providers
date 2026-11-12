@@ -18,6 +18,11 @@ import {
   type UsageWindow,
 } from "@getpaseo/plugin/server/usage";
 import { AcpClient } from "./internal/acp-client.js";
+import {
+  AntigravityError,
+  providerError,
+  logDiagnostic,
+} from "./internal/diagnostics.js";
 
 const usageInputSchema = z
   .object({
@@ -45,7 +50,7 @@ type QuotaWindowSnapshot = z.infer<typeof quotaWindowSchema>;
 type CachedUsageSnapshot = z.infer<typeof cachedUsageSchema>;
 
 const PTY_USAGE_PYTHON_SCRIPT = `
-import pty, os, time, select, sys, fcntl, struct, termios, signal
+import pty, os, time, select, sys, fcntl, struct, termios, signal, json
 
 cmd = sys.argv[1:]
 if not cmd:
@@ -62,6 +67,7 @@ else:
     start = time.time()
     stage = 0
     stage_time = start
+    failure = None
     while time.time() - start < 14.0:
         r, _, _ = select.select([fd], [], [], 0.15)
         if r:
@@ -73,6 +79,9 @@ else:
             except OSError:
                 break
         now = time.time()
+        if stage == 0 and (b"Do you trust" in out or b"trust the contents" in out):
+            failure = "workspace_trust_required"
+            break
         if stage == 0 and b"for shortcuts" in out:
             os.write(fd, b"\\x1b")
             stage = 1
@@ -87,7 +96,7 @@ else:
             stage_time = now
         elif stage == 3:
             tail = out.split(b"CLAUDE AND GPT MODELS")[-1] if b"CLAUDE AND GPT MODELS" in out else b""
-            if (b"Quota available" in tail or tail.count(b"%") >= 2) or (now - stage_time > 3.5):
+            if b"Quota available" in tail or tail.count(b"%") >= 2:
                 if now - stage_time > 0.6:
                     break
     try:
@@ -110,7 +119,7 @@ else:
         os.close(fd)
     except OSError:
         pass
-    sys.stdout.write(out.decode("utf-8", "replace"))
+    sys.stdout.write(json.dumps({"output": out.decode("utf-8", "replace"), "stage": stage, "failure": failure}))
 `;
 
 function resolveHome(env?: Record<string, string | undefined>): string {
@@ -452,25 +461,59 @@ export class AntigravityUsage {
 
       if (this.closed) throw new Error("Antigravity usage source is closed");
       const launch = this.resolveLaunchForHome(home);
-      const ptyResult = await execCommand(
-        "python3",
-        ["-c", PTY_USAGE_PYTHON_SCRIPT, launch.command, ...launch.args],
-        {
-          env: launch.env,
-          timeout: 18_000,
-          maxBuffer: 512 * 1024,
-        },
-      ).catch((err) => ({
-        stdout: "",
-        stderr: err instanceof Error ? err.message : String(err),
-      }));
-
-      const observedAtMs = Date.now();
-      const parsed = parsePtyUsageOutput(ptyResult.stdout, observedAtMs);
-      if (parsed.windows.length === 0)
-        throw new Error(
-          "Could not refresh Antigravity quota; cached quota is not current. Ensure agy and python3 are available and signed in.",
+      let stdout: string;
+      try {
+        const result = await execCommand(
+          "python3",
+          ["-c", PTY_USAGE_PYTHON_SCRIPT, launch.command, ...launch.args],
+          {
+            cwd: home,
+            env: launch.env,
+            timeout: 18_000,
+            maxBuffer: 4 * 512 * 1024,
+          },
         );
+        stdout = result.stdout;
+      } catch (cause) {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        const error = new AntigravityError(
+          "Antigravity quota probe could not run: " + detail,
+          "QUOTA_PROBE_FAILED",
+        );
+        logDiagnostic("quota.probe_failed", { stage: "process" }, error);
+        throw error;
+      }
+      const probe = z
+        .object({
+          output: z.string(),
+          stage: z.number().int().min(0).max(3),
+          failure: z.string().nullable(),
+        })
+        .parse(JSON.parse(stdout));
+      const observedAtMs = Date.now();
+      const parsed = parsePtyUsageOutput(probe.output, observedAtMs);
+      if (parsed.windows.length === 0) {
+        let message =
+          "Antigravity /usage returned no quota windows; its output format may have changed.";
+        let code = "QUOTA_OUTPUT_UNRECOGNIZED";
+        if (probe.failure === "workspace_trust_required") {
+          message =
+            "Antigravity quota probe is waiting for trust approval in the account home directory. Open agy there and review the trust prompt; the provider will not approve it automatically.";
+          code = "QUOTA_TRUST_REQUIRED";
+        } else if (probe.stage < 3) {
+          message =
+            "Antigravity quota probe did not reach the /usage prompt. Open agy in the account home directory to review its startup screen.";
+          code = "QUOTA_STARTUP_FAILED";
+        }
+        const error = new AntigravityError(message, code);
+        logDiagnostic(
+          "quota.probe_failed",
+          { stage: probe.stage, outputBytes: probe.output.length },
+          error,
+        );
+        throw error;
+      }
+      logDiagnostic("quota.refreshed", { windows: parsed.windows.length });
       const tierResult =
         parsed.tierName || prior?.tierName
           ? {
@@ -605,7 +648,7 @@ export class AntigravityUsage {
         } catch (error) {
           return {
             status: "error",
-            error: error instanceof Error ? error.message : String(error),
+            error: providerError(error).message,
           };
         }
       },

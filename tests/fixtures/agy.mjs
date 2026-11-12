@@ -140,6 +140,14 @@ input.on("line", (line) => {
         error(f, "plan rejected");
         break;
       }
+      if (
+        f.params.configId === "mode" &&
+        f.params.value === "default" &&
+        process.env.FIXTURE_REJECT_IMPLEMENT === "1"
+      ) {
+        error(f, "implementation mode rejected");
+        break;
+      }
       if (f.params.configId === "model") model = f.params.value;
       else if (f.params.configId === "reasoning") thought = f.params.value;
       else if (f.params.configId === "mode") mode = f.params.value;
@@ -244,7 +252,8 @@ input.on("line", (line) => {
         text === "background-transcript" ||
         text === "background-held" ||
         text === "background-late" ||
-        text === "background-daemon"
+        text === "background-daemon" ||
+        text === "schedule-held"
       ) {
         const logs = path.join(
           process.env.HOME,
@@ -257,6 +266,23 @@ input.on("line", (line) => {
         );
         mkdirSync(logs, { recursive: true });
         const file = path.join(logs, "transcript_full.jsonl");
+        const toolName = text === "schedule-held" ? "schedule" : "run_command";
+        const toolArgs =
+          text === "schedule-held"
+            ? {
+                DurationSeconds: 60,
+                Prompt: "Check progress",
+                TimerCondition: "any",
+              }
+            : {
+                CommandLine: "sleep 18",
+                IsDaemon: text === "background-daemon",
+              };
+        const taskText =
+          "Tool is running as a background task with task id: fixture/task-2" +
+          (text === "schedule-held"
+            ? "\nTask Description: Timer: 1m, Prompt: Check progress"
+            : "");
         const records = [
           {
             type: "USER_INPUT",
@@ -268,11 +294,8 @@ input.on("line", (line) => {
             step_index: 1,
             tool_calls: [
               {
-                name: "run_command",
-                args: {
-                  CommandLine: "sleep 18",
-                  IsDaemon: text === "background-daemon",
-                },
+                name: toolName,
+                args: toolArgs,
               },
             ],
           },
@@ -280,8 +303,7 @@ input.on("line", (line) => {
             type: "GENERIC",
             step_index: 2,
             status: "RUNNING",
-            content:
-              "Tool is running as a background task with task id: fixture/task-2",
+            content: taskText,
           },
           {
             type: "PLANNER_RESPONSE",
@@ -298,10 +320,10 @@ input.on("line", (line) => {
         send(
           update("tool_call", {
             toolCallId: "background-call",
-            name: "run_command",
+            name: toolName,
             kind: "execute",
             status: "in_progress",
-            rawInput: { CommandLine: "sleep 18" },
+            rawInput: toolArgs,
           }),
         );
         send(chunk("agent_message_chunk", "waiting"));
@@ -331,6 +353,219 @@ input.on("line", (line) => {
               ),
             50,
           );
+        break;
+      }
+      if (text === "plan-proposal" || text === "ordinary-artifact") {
+        const file = path.join(
+          process.env.HOME,
+          ".gemini",
+          "antigravity-cli",
+          "brain",
+          "fixture",
+          "implementation_plan.md",
+        );
+        const input = {
+          Path: file,
+          Content: "# Implementation plan\nCreate output.txt and verify it.",
+          ArtifactMetadata: {
+            RequestFeedback: text === "plan-proposal",
+            UserFacing: true,
+            Summary: "Tiny implementation",
+          },
+        };
+        send(
+          update("tool_call", {
+            toolCallId: "plan-file",
+            name: "write_file",
+            kind: "edit",
+            status: "in_progress",
+            rawInput: input,
+          }),
+        );
+        mkdirSync(path.dirname(file), { recursive: true });
+        writeFileSync(file, input.Content);
+        const logs = path.join(path.dirname(file), ".system_generated", "logs");
+        mkdirSync(logs, { recursive: true });
+        writeFileSync(
+          path.join(logs, "transcript_full.jsonl"),
+          [
+            { type: "USER_INPUT", step_index: 0, content: text },
+            {
+              type: "PLANNER_RESPONSE",
+              step_index: 1,
+              status: "DONE",
+              tool_calls: [{ name: "write_file", args: input }],
+            },
+            {
+              type: "CODE_ACTION",
+              step_index: 2,
+              status: "DONE",
+              content: "written",
+            },
+            {
+              type: "PLANNER_RESPONSE",
+              step_index: 3,
+              status: "DONE",
+              content: "Please review the plan.",
+            },
+          ]
+            .map((r) => JSON.stringify(r))
+            .join("\n") + "\n",
+        );
+        send(
+          update("tool_call_update", {
+            toolCallId: "plan-file",
+            status: "completed",
+          }),
+        );
+        send(chunk("agent_message_chunk", "Please review the plan."));
+        reply(f, { stopReason: "end_turn" });
+        break;
+      }
+      if (text === "subagent-task") {
+        const root = path.join(
+          process.env.HOME,
+          ".gemini",
+          "antigravity-cli",
+          "brain",
+        );
+        const child = "12345678-1234-4123-8123-123456789abc";
+        const parentFile = path.join(
+          root,
+          "fixture",
+          ".system_generated",
+          "logs",
+          "transcript_full.jsonl",
+        );
+        const childFile = path.join(
+          root,
+          child,
+          ".system_generated",
+          "logs",
+          "transcript_full.jsonl",
+        );
+        const args = {
+          Prompt: "Read input.txt",
+          Role: "File reader",
+          TypeName: "research",
+          Model: "flash_lite",
+        };
+        const output =
+          "Created the following subagent:\n" +
+          JSON.stringify(
+            { conversationId: child, workspaceUris: ["file:///tmp"] },
+            null,
+            2,
+          ) +
+          "\nThe subagent will send you a message when it has completed.";
+        mkdirSync(path.dirname(parentFile), { recursive: true });
+        mkdirSync(path.dirname(childFile), { recursive: true });
+        writeFileSync(
+          parentFile,
+          [
+            { type: "USER_INPUT", step_index: 0, content: "delegate" },
+            {
+              type: "PLANNER_RESPONSE",
+              step_index: 1,
+              status: "DONE",
+              tool_calls: [{ name: "invoke_subagent", args }],
+            },
+            { type: "GENERIC", step_index: 2, status: "DONE", content: output },
+            {
+              type: "PLANNER_RESPONSE",
+              step_index: 3,
+              status: "DONE",
+              content: "waiting for subagent",
+            },
+          ]
+            .map((r) => JSON.stringify(r))
+            .join("\n") + "\n",
+        );
+        writeFileSync(
+          childFile,
+          [
+            {
+              type: "SYSTEM_MESSAGE",
+              step_index: 0,
+              status: "DONE",
+              content: "child input",
+            },
+            {
+              type: "PLANNER_RESPONSE",
+              step_index: 1,
+              status: "DONE",
+              thinking: "reading",
+              tool_calls: [
+                { name: "read_file", args: { Path: "/tmp/input.txt" } },
+              ],
+            },
+          ]
+            .map((r) => JSON.stringify(r))
+            .join("\n") + "\n",
+        );
+        send(
+          update("tool_call", {
+            toolCallId: "spawn-child",
+            name: "invoke_subagent",
+            status: "in_progress",
+            rawInput: args,
+          }),
+        );
+        send(
+          update("tool_call_update", {
+            toolCallId: "spawn-child",
+            status: "completed",
+            rawOutput: output,
+          }),
+        );
+        send(chunk("agent_message_chunk", "waiting for subagent"));
+        reply(f, { stopReason: "end_turn" });
+        setTimeout(() => {
+          appendFileSync(
+            childFile,
+            [
+              {
+                type: "GENERIC",
+                step_index: 2,
+                status: "DONE",
+                content: "alpha beta",
+              },
+              {
+                type: "PLANNER_RESPONSE",
+                step_index: 3,
+                status: "DONE",
+                content: "CHILD_DONE",
+              },
+            ]
+              .map((r) => JSON.stringify(r))
+              .join("\n") + "\n",
+          );
+          appendFileSync(
+            parentFile,
+            JSON.stringify({
+              type: "SYSTEM_MESSAGE",
+              step_index: 4,
+              status: "DONE",
+              content:
+                "<SYSTEM_MESSAGE> sender=" +
+                child +
+                "\nCHILD_DONE</SYSTEM_MESSAGE>",
+            }) + "\n",
+          );
+          setTimeout(
+            () =>
+              appendFileSync(
+                parentFile,
+                JSON.stringify({
+                  type: "PLANNER_RESPONSE",
+                  step_index: 5,
+                  status: "DONE",
+                  content: "PARENT_DONE",
+                }) + "\n",
+              ),
+            80,
+          );
+        }, 80);
         break;
       }
       if (text === "hold") {
