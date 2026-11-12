@@ -1,0 +1,14 @@
+{
+  "name": "paseo-providers",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Monorepo for custom & enhanced Paseo agent providers and usage sources",
+  "type": "module",
+  "scripts": {
+    "install:all": "bash ./install.sh --all",
+    "install:restart": "bash ./install.sh --all --restart",
+    "list": "bash ./install.sh --list",
+    "new": "bash ./install.sh --new",
+    "uninstall": "bash ./install.sh --uninstall"
+  }
+}

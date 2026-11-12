@@ -1,0 +1,7 @@
+node_modules/
+.backup-original/
+backup-original/
+*.tgz
+*.tar.gz
+*.zip
+.DS_Store
