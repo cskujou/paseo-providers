@@ -215,6 +215,16 @@ export function buildToolDetail(
   }
 
   if (
+    (lowerName === "write_file" || lowerName === "write_to_file") &&
+    filePath
+  ) {
+    let content = state.diff?.newText;
+    if (typeof input.Content === "string") content = input.Content;
+    else if (typeof input.CodeContent === "string") content = input.CodeContent;
+    return { type: "write", filePath, content };
+  }
+
+  if (
     state.diff ||
     state.kind === "edit" ||
     lowerName === "edit_file" ||
@@ -233,16 +243,6 @@ export function buildToolDetail(
           state.diff?.newText ??
           asString(input.Replacement) ??
           asString(input.ReplacementContent),
-      };
-    }
-  }
-
-  if (lowerName === "write_file" || lowerName === "write_to_file") {
-    if (filePath) {
-      return {
-        type: "write",
-        filePath,
-        content: asString(input.Content) ?? asString(input.CodeContent),
       };
     }
   }

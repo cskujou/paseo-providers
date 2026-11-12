@@ -21,7 +21,14 @@ import {
 } from "./internal/acp-client.js";
 import { catalogFromModelOutput, fallbackCatalog } from "./internal/catalog.js";
 import { Session } from "./internal/session.js";
+import { readTranscriptSummary } from "./internal/transcript-history.js";
 import type { AntigravityUsage } from "./usage.js";
+
+// Paseo 0.14's SDK only exposes description; the host patch preserves both previews.
+interface AntigravitySessionSummary extends ProviderSessionSummary {
+  firstPromptPreview?: string;
+  lastPromptPreview?: string;
+}
 
 const capabilities = [
   "prompt.message",
@@ -119,7 +126,7 @@ async function checkStatus(launch: ProviderLaunch): Promise<ProviderStatus> {
 async function listAcpSessions(
   launch: ProviderLaunch,
   input: Extract<ProviderInput, { type: "sessions" }>,
-): Promise<ProviderSessionSummary[]> {
+): Promise<AntigravitySessionSummary[]> {
   const client = new AcpClient({
     launch,
     cwd: input.cwd ?? os.homedir(),
@@ -131,6 +138,7 @@ async function listAcpSessions(
         sessionId: z.string().min(1),
         cwd: z.string(),
         title: z.string().optional(),
+        description: z.string().optional(),
         updatedAt: z.string().optional(),
       }),
     ),
@@ -138,10 +146,11 @@ async function listAcpSessions(
   });
   try {
     await client.initialize();
-    const mapped: ProviderSessionSummary[] = [];
+    const mapped: AntigravitySessionSummary[] = [];
     const cursors = new Set<string>();
     let cursor: string | undefined;
-    const query = input.query?.toLowerCase();
+    const query = input.query?.trim().toLowerCase();
+    if (input.limit !== undefined && input.limit <= 0) return [];
     do {
       const page = pageSchema.parse(
         await client.request(
@@ -154,11 +163,23 @@ async function listAcpSessions(
         ),
       );
       for (const session of page.sessions) {
+        const summary = await readTranscriptSummary(
+          session.sessionId,
+          launch.env,
+        );
+        const firstPromptPreview = summary.firstPromptPreview;
+        const lastPromptPreview =
+          summary.lastPromptPreview ??
+          session.description?.trim().replace(/\s+/g, " ").slice(0, 160);
         if (
           query &&
-          ![session.title ?? "", session.sessionId].some((value) =>
-            value.toLowerCase().includes(query),
-          )
+          ![
+            session.title ?? "",
+            session.sessionId,
+            firstPromptPreview ?? "",
+            lastPromptPreview ?? "",
+            session.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? "",
+          ].some((value) => value.toLowerCase().includes(query))
         )
           continue;
         mapped.push({
@@ -170,8 +191,14 @@ async function listAcpSessions(
             },
           },
           cwd: session.cwd,
-          title: session.title,
-          updatedAt: session.updatedAt,
+          title: session.title?.trim() || firstPromptPreview,
+          description: lastPromptPreview,
+          firstPromptPreview,
+          lastPromptPreview,
+          updatedAt:
+            session.updatedAt && Number.isFinite(Date.parse(session.updatedAt))
+              ? session.updatedAt
+              : summary.updatedAt,
         });
         if (input.limit !== undefined && mapped.length >= input.limit)
           return mapped.slice(0, input.limit);

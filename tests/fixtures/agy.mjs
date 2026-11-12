@@ -145,6 +145,69 @@ input.on("line", (line) => {
       break;
     case "session/prompt": {
       const text = f.params.prompt[0]?.text;
+      if (
+        text === "early-end" ||
+        text === "early-end-hold" ||
+        text === "early-end-exit"
+      ) {
+        send(
+          update("tool_call", {
+            toolCallId: "reused-tool",
+            title: "unfinished",
+            kind: "other",
+            status: "in_progress",
+          }),
+        );
+        reply(f, { stopReason: "end_turn" });
+        if (text === "early-end-exit") setTimeout(() => process.exit(7), 40);
+        if (text === "early-end")
+          setTimeout(() => {
+            send(
+              chunk(
+                "agent_thought_chunk",
+                "old-turn-thought",
+                "reused-message",
+              ),
+            );
+            send(
+              update("tool_call_update", {
+                toolCallId: "reused-tool",
+                status: "completed",
+              }),
+            );
+          }, 40);
+        break;
+      }
+      if (text === "late-after-end") {
+        send(chunk("agent_message_chunk", "first answer", "reused-message"));
+        reply(f, { stopReason: "end_turn" });
+        // This old stream must never survive into the next prompt.
+        setTimeout(() => {
+          send(
+            chunk("agent_thought_chunk", "late-old-thought", "reused-message"),
+          );
+          send(
+            update("tool_call_update", {
+              toolCallId: "reused-tool",
+              status: "in_progress",
+            }),
+          );
+        }, 40);
+        break;
+      }
+      if (text === "reuse-identities") {
+        send(chunk("agent_message_chunk", "new answer", "reused-message"));
+        send(
+          update("tool_call", {
+            toolCallId: "reused-tool",
+            title: "new tool",
+            kind: "other",
+            status: "completed",
+          }),
+        );
+        reply(f, { stopReason: "end_turn" });
+        break;
+      }
       if (text === "hold") {
         activePrompt = f;
         break;

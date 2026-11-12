@@ -20,7 +20,7 @@ const pluginProviderPath = path.join(paseoServerDir, "server", "agent", "plugin-
 if (!fs.existsSync(pluginProviderPath)) {
   fail("Missing " + pluginProviderPath + ". Paseo's plugin host layout changed; rewind needs this patch.");
 }
-const pluginProviderSrc = fs.readFileSync(pluginProviderPath, "utf8");
+let pluginProviderSrc = fs.readFileSync(pluginProviderPath, "utf8");
 const rewindPatchApplied =
   pluginProviderSrc.includes("this.history.length = index;") &&
   pluginProviderSrc.includes("this.timelineSnapshots.clear();");
@@ -62,9 +62,48 @@ if (rewindPatchApplied) {
         ". Paseo changed this code; update the rewind patch before deploying.",
     );
   }
-  fs.writeFileSync(pluginProviderPath, pluginProviderSrc.replace(target, replacement), "utf8");
+  pluginProviderSrc = pluginProviderSrc.replace(target, replacement);
   console.log("  + Patched server/agent/plugin-provider.js (rewind history truncation)");
 }
+
+// Preserve optional prompt previews until the SDK exposes them. Description remains
+// the fallback for other plugins that use the existing 0.14 session summary contract.
+const summaryTarget = [
+  "            firstPromptPreview: null,",
+  "            lastPromptPreview: session.description ?? null,",
+].join("\n");
+const summaryReplacement = [
+  "            firstPromptPreview: session.firstPromptPreview ?? null,",
+  "            lastPromptPreview: session.lastPromptPreview ?? session.description ?? null,",
+].join("\n");
+if (pluginProviderSrc.includes(summaryReplacement)) {
+  console.log("  = PluginAgentClient prompt previews already patched");
+} else {
+  if (!pluginProviderSrc.includes(summaryTarget)) {
+    fail("Could not find PluginAgentClient session summary mapping in " + pluginProviderPath + "; update the prompt-preview patch before deploying.");
+  }
+  pluginProviderSrc = pluginProviderSrc.replace(summaryTarget, summaryReplacement);
+  console.log("  + Patched PluginAgentClient session prompt previews");
+}
+const eventTarget = "        onEvent: (listener) => connection.onEvent((event) => listener(ProviderEventSchema.parse(event))),";
+const eventReplacement = [
+  "        onEvent: (listener) => connection.onEvent((event) => {",
+  "            const parsed = ProviderEventSchema.parse(event);",
+  "            if (parsed.type === \"sessions\") {",
+  "                const previews = z.object({ sessions: z.array(z.object({",
+  "                    firstPromptPreview: z.string().optional(),",
+  "                    lastPromptPreview: z.string().optional(),",
+  "                }).strip()) }).parse(event);",
+  "                parsed.sessions = parsed.sessions.map((session, index) => ({ ...session, ...previews.sessions[index] }));",
+  "            }",
+  "            listener(parsed);",
+  "        }),",
+].join("\n");
+if (!pluginProviderSrc.includes(eventReplacement)) {
+  if (!pluginProviderSrc.includes(eventTarget)) fail("Could not find normalizeConnection event validation in " + pluginProviderPath + "; update the prompt-preview patch before deploying.");
+  pluginProviderSrc = pluginProviderSrc.replace(eventTarget, eventReplacement);
+}
+fs.writeFileSync(pluginProviderPath, pluginProviderSrc, "utf8");
 
 // 2. Ensure all installedPluginIds are registered in server/plugins/builtin/index.js
 const builtinIndexPath = path.join(paseoServerDir, "server", "plugins", "builtin", "index.js");

@@ -86,6 +86,7 @@ export function resolveTranscriptDir(
   nativeSessionId: string,
   env: Record<string, string | undefined> = process.env,
 ): string {
+  resolveConversationDbPath(nativeSessionId, env);
   return path.join(
     resolveAntigravityCliDir(env),
     "brain",

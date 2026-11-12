@@ -1,44 +1,181 @@
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import { z } from "zod";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { resolveTranscriptDir } from "./rewind.js";
 import { acpToolToTimelineItem, type AcpToolCallState } from "./timeline.js";
 
-/** Matches the daemon timeline content cap used by other history replays. */
 const MAX_TEXT_UNITS = 64 * 1024;
-
-interface TranscriptRecord {
-  step_index?: number;
-  type?: string;
-  status?: string;
-  content?: string;
-  thinking?: string;
-  tool_calls?: Array<{ name?: string; args?: Record<string, unknown> }>;
-}
+const transcriptRecordSchema = z.object({
+  step_index: z.number().int().nonnegative().optional(),
+  created_at: z.string().optional(),
+  type: z.string().optional(),
+  status: z.string().optional(),
+  content: z.string().optional(),
+  thinking: z.string().optional(),
+  exit_code: z.number().int().optional(),
+  tool_calls: z
+    .array(
+      z.object({
+        name: z.string().optional(),
+        args: z.record(z.string(), z.json()).optional(),
+      }),
+    )
+    .optional(),
+});
+export type TranscriptTimelineItem = ProviderTimelineItem & {
+  timestamp?: string;
+};
 
 interface PendingTool {
   state: AcpToolCallState;
+  index: number;
+}
+export interface TranscriptSummary {
+  firstPromptPreview?: string;
+  lastPromptPreview?: string;
+  updatedAt?: string;
 }
 
-/**
- * Rebuild a Paseo timeline from agy's on-disk transcript.
- *
- * `agy acp` session/load finds the conversation and then closes its update
- * stream without emitting past turns. The transcript next to that conversation
- * is the copy that still has them.
- */
+// Listing metadata must not allocate an entire timeline or run session/load per row.
+export async function readTranscriptSummary(
+  conversationId: string,
+  env: Record<string, string | undefined>,
+): Promise<TranscriptSummary> {
+  const file = await resolveTranscriptFile(conversationId, env);
+  if (!file) return {};
+  const summary: TranscriptSummary = { updatedAt: file.updatedAt };
+  for await (const record of readTranscriptRecords(file.path)) {
+    if (record.type !== "USER_INPUT" || !record.content) continue;
+    const text = displayUserText(record.content)
+      .replace(/\s+/g, " ")
+      .slice(0, 160);
+    if (!text) continue;
+    summary.firstPromptPreview ??= text;
+    summary.lastPromptPreview = text;
+  }
+  return summary;
+}
+
 export async function readTranscriptTimeline(
   conversationId: string,
   env: Record<string, string | undefined> = process.env,
-): Promise<ProviderTimelineItem[]> {
-  const filePath = await resolveTranscriptFile(conversationId, env);
-  if (!filePath) return [];
-
-  const items: ProviderTimelineItem[] = [];
+): Promise<TranscriptTimelineItem[]> {
+  const file = await resolveTranscriptFile(conversationId, env);
+  if (!file) return [];
+  const items: TranscriptTimelineItem[] = [];
   const pending: PendingTool[] = [];
+  for await (const record of readTranscriptRecords(file.path)) {
+    const stepIndex = record.step_index ?? items.length;
+    const timestamp =
+      record.created_at && Number.isFinite(Date.parse(record.created_at))
+        ? new Date(record.created_at).toISOString()
+        : undefined;
+    const type = record.type ?? "";
+    if (type === "USER_INPUT" || type === "PLANNER_RESPONSE")
+      flushPending(items, pending);
+    if (type === "USER_INPUT") {
+      const text = displayUserText(record.content ?? "");
+      if (!text) continue;
+      const id = "history:" + stepIndex + ":user";
+      items.push({
+        type: "user_message",
+        id,
+        messageId: id,
+        text: boundText(text),
+        timestamp,
+      });
+      continue;
+    }
+    if (type === "PLANNER_RESPONSE") {
+      const thinking = boundText(record.thinking ?? "").trim();
+      if (thinking)
+        items.push({
+          type: "reasoning",
+          id: "history:" + stepIndex + ":reasoning",
+          text: thinking,
+          timestamp,
+        });
+      const content = boundText(record.content ?? "").trim();
+      if (content) {
+        const id = "history:" + stepIndex + ":assistant";
+        items.push({
+          type: "assistant_message",
+          id,
+          messageId: id,
+          text: content,
+          timestamp,
+        });
+      }
+      for (const [index, call] of (record.tool_calls ?? []).entries()) {
+        const name = call.name || "tool";
+        const args = boundValue(call.args ?? {});
+        const id = "history:" + stepIndex + ":tool:" + index;
+        const state: AcpToolCallState = {
+          toolCallId: id,
+          name,
+          title: toolTitle(name, args),
+          kind: toolKind(name),
+          status: "in_progress",
+          rawInput: args,
+          rawOutput: null,
+          locations: [],
+        };
+        // Keep call order even when tools finish in a different order.
+        pending.push({ state, index: items.length });
+        items.push({ ...acpToolToTimelineItem(state), timestamp });
+      }
+      continue;
+    }
+    const toolIndex =
+      type === "GENERIC"
+        ? 0
+        : pending.findIndex((tool) =>
+            matchesToolResult(tool.state.name!, type),
+          );
+    if (toolIndex < 0 || pending.length === 0) continue;
+    const tool = pending.splice(toolIndex, 1)[0]!;
+    tool.state.rawOutput = boundText(record.content ?? "");
+    const item = toolItem(tool.state, toolOutcome(record.status));
+    if (item.detail.type === "shell" && record.exit_code !== undefined)
+      item.detail = { ...item.detail, exitCode: record.exit_code };
+    items[tool.index] = {
+      ...item,
+      timestamp: items[tool.index]?.timestamp ?? timestamp,
+    };
+  }
+  flushPending(items, pending);
+  return items;
+}
+
+async function resolveTranscriptFile(
+  conversationId: string,
+  env: Record<string, string | undefined>,
+): Promise<{ path: string; updatedAt: string } | null> {
+  const logsDir = resolveTranscriptDir(conversationId, env);
+  for (const name of ["transcript_full.jsonl", "transcript.jsonl"]) {
+    const filePath = path.join(logsDir, name);
+    try {
+      const info = await stat(filePath);
+      if (info.isFile() && info.size > 0)
+        return { path: filePath, updatedAt: info.mtime.toISOString() };
+    } catch (error) {
+      if (
+        !error ||
+        typeof error !== "object" ||
+        !("code" in error) ||
+        error.code !== "ENOENT"
+      )
+        throw error;
+    }
+  }
+  return null;
+}
+
+async function* readTranscriptRecords(filePath: string) {
   const stream = createReadStream(filePath, { encoding: "utf8" });
   const lines = readline.createInterface({
     input: stream,
@@ -46,190 +183,113 @@ export async function readTranscriptTimeline(
   });
   try {
     for await (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let record: TranscriptRecord;
+      if (!line.trim()) continue;
+      let value: unknown;
       try {
-        record = JSON.parse(trimmed) as TranscriptRecord;
+        value = JSON.parse(line);
       } catch {
+        // A running session can leave a partially written JSONL record at the end.
         continue;
       }
-      const stepIndex =
-        typeof record.step_index === "number"
-          ? record.step_index
-          : items.length;
-      const type = record.type ?? "";
-      if (type === "USER_INPUT" || type === "PLANNER_RESPONSE") {
-        flushPending(items, pending, "canceled");
-      }
-      if (type === "USER_INPUT") {
-        const text = displayUserText(record.content ?? "");
-        if (!text) continue;
-        const id = `history:${stepIndex}:user`;
-        items.push({
-          type: "user_message",
-          id,
-          messageId: id,
-          text,
-        });
-        continue;
-      }
-      if (type === "PLANNER_RESPONSE") {
-        const thinking = boundText(record.thinking ?? "").trim();
-        if (thinking) {
-          items.push({
-            type: "reasoning",
-            id: `history:${stepIndex}:reasoning`,
-            text: thinking,
-          });
-        }
-        const content = boundText(record.content ?? "").trim();
-        if (content) {
-          const id = `history:${stepIndex}:assistant`;
-          items.push({
-            type: "assistant_message",
-            id,
-            messageId: id,
-            text: content,
-          });
-        }
-        for (const [index, call] of (record.tool_calls ?? []).entries()) {
-          const name =
-            typeof call.name === "string" && call.name ? call.name : "tool";
-          const args = asRecord(boundValue(call.args ?? {}));
-          const id = `history:${stepIndex}:tool:${index}`;
-          pending.push({
-            state: {
-              toolCallId: id,
-              name,
-              title: toolTitle(name, args),
-              kind: toolKind(name),
-              status: "completed",
-              rawInput: args as JsonValue,
-              rawOutput: null,
-              locations: [],
-            },
-          });
-        }
-        continue;
-      }
-      if (type === "GENERIC") {
-        const tool = pending.shift();
-        if (!tool) continue;
-        const output = boundText(record.content ?? "");
-        tool.state.rawOutput = output;
-        items.push(toolItem(tool.state, toolOutcome(record.status)));
-      }
+      yield transcriptRecordSchema.parse(value);
     }
   } finally {
     lines.close();
-  }
-  flushPending(items, pending, "canceled");
-  return items;
-}
-
-async function resolveTranscriptFile(
-  conversationId: string,
-  env: Record<string, string | undefined>,
-): Promise<string | null> {
-  const logsDir = resolveTranscriptDir(conversationId, env);
-  const full = path.join(logsDir, "transcript_full.jsonl");
-  const compact = path.join(logsDir, "transcript.jsonl");
-  if (await nonempty(full)) return full;
-  if (await nonempty(compact)) return compact;
-  return null;
-}
-
-async function nonempty(filePath: string): Promise<boolean> {
-  if (!existsSync(filePath)) return false;
-  try {
-    return (await stat(filePath)).size > 0;
-  } catch {
-    return false;
+    stream.destroy();
   }
 }
 
+function matchesToolResult(name: string, type: string): boolean {
+  if (
+    name.toUpperCase() === type ||
+    (name === "list_dir" && type === "LIST_DIRECTORY")
+  )
+    return true;
+  return (
+    type === "CODE_ACTION" &&
+    [
+      "edit_file",
+      "replace_file_content",
+      "multi_replace_file_content",
+      "write_file",
+      "write_to_file",
+    ].includes(name)
+  );
+}
 function flushPending(
-  items: ProviderTimelineItem[],
+  items: TranscriptTimelineItem[],
   pending: PendingTool[],
-  outcome: "canceled",
 ): void {
-  for (const tool of pending.splice(0)) {
-    items.push(toolItem(tool.state, outcome));
-  }
+  for (const tool of pending.splice(0))
+    items[tool.index] = {
+      ...toolItem(tool.state, "canceled"),
+      timestamp: items[tool.index]?.timestamp,
+    };
 }
-
-function toolOutcome(
-  status: string | undefined,
-): "completed" | "failed" | "canceled" {
+function toolOutcome(status?: string): "completed" | "failed" | "canceled" {
   if (status === "DONE") return "completed";
   if (status === "ERROR") return "failed";
   return "canceled";
 }
-
 function toolItem(
   state: AcpToolCallState,
   outcome: "completed" | "failed" | "canceled",
-): ProviderTimelineItem {
-  if (outcome === "failed") {
-    return acpToolToTimelineItem({ ...state, status: "failed" });
-  }
-  const completed = acpToolToTimelineItem({ ...state, status: "completed" });
-  if (outcome === "canceled") {
-    return { ...completed, status: "canceled", error: null };
-  }
-  return completed;
+): Extract<ProviderTimelineItem, { type: "tool_call" }> {
+  const item = acpToolToTimelineItem({
+    ...state,
+    status: outcome === "failed" ? "failed" : "completed",
+  });
+  return outcome === "canceled"
+    ? { ...item, status: "canceled", error: null }
+    : item;
 }
-
 function displayUserText(content: string): string {
-  const wrapped = content.match(
-    /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/,
+  const wrapped = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(
+    content,
   );
-  const inner = wrapped ? wrapped[1] : content;
-  const visible = inner.split(/<ADDITIONAL_METADATA>/)[0] ?? inner;
-  return boundText(visible).trim();
+  const inner = wrapped ? wrapped[1]! : content;
+  return inner.split(/<ADDITIONAL_METADATA>/)[0]!.trim();
 }
-
-function toolTitle(name: string, args: Record<string, unknown>): string {
-  const summary = args.toolSummary;
-  if (typeof summary === "string" && summary.trim())
-    return boundText(summary.trim());
+function toolTitle(name: string, args: JsonValue): string {
+  if (
+    args &&
+    typeof args === "object" &&
+    !Array.isArray(args) &&
+    typeof args.toolSummary === "string" &&
+    args.toolSummary.trim()
+  )
+    return boundText(args.toolSummary.trim());
   return name;
 }
-
 function toolKind(name: string): string | undefined {
   if (name === "run_command") return "execute";
-  if (name === "read_file" || name === "view_file") return "read";
-  if (name === "edit_file" || name === "write_file" || name === "write_to_file")
+  if (["read_file", "view_file", "list_directory"].includes(name))
+    return "read";
+  if (
+    [
+      "edit_file",
+      "replace_file_content",
+      "multi_replace_file_content",
+      "write_file",
+      "write_to_file",
+    ].includes(name)
+  )
     return "edit";
   return undefined;
 }
-
 function boundText(text: string): string {
-  if (text.length <= MAX_TEXT_UNITS) return text;
-  return `${text.slice(0, MAX_TEXT_UNITS)}\n…[truncated]`;
+  return text.length > MAX_TEXT_UNITS
+    ? text.slice(0, MAX_TEXT_UNITS) + "\n…[truncated]"
+    : text;
 }
-
-function boundValue(value: unknown, depth = 0): unknown {
+function boundValue(value: JsonValue, depth = 0): JsonValue {
   if (typeof value === "string") return boundText(value);
-  if (typeof value === "number" || typeof value === "boolean" || value === null)
-    return value;
+  if (value === null || typeof value !== "object") return value;
   if (depth > 8) return null;
   if (Array.isArray(value))
     return value.slice(0, 200).map((entry) => boundValue(entry, depth + 1));
-  if (typeof value === "object" && value) {
-    const out: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value)) {
-      out[key] = boundValue(entry, depth + 1);
-    }
-    return out;
-  }
-  return null;
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  return {};
+  const bounded: Record<string, JsonValue> = {};
+  for (const [key, entry] of Object.entries(value))
+    bounded[key] = boundValue(entry, depth + 1);
+  return bounded;
 }

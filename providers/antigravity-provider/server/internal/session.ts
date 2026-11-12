@@ -42,7 +42,10 @@ import {
   SessionRewindTracker,
   readUserStepIndices,
 } from "./rewind.js";
-import { readTranscriptTimeline } from "./transcript-history.js";
+import {
+  readTranscriptTimeline,
+  type TranscriptTimelineItem,
+} from "./transcript-history.js";
 import {
   acpToolToTimelineItem,
   buildToolDetail,
@@ -100,6 +103,7 @@ interface ActiveTurn {
   canceled: boolean;
   completion: Promise<void>;
   resolve(): void;
+  activity: ReturnType<typeof Promise.withResolvers<void>>;
 }
 
 type ProviderRevertScope = Extract<
@@ -139,7 +143,7 @@ export class Session {
   private replayMode: "none" | "replay" | "skip" = "none";
   private replayUserStepIndices: number[] = [];
   private replayUserTurnCount = 0;
-  private readonly bufferedReplayItems: ProviderTimelineItem[] = [];
+  private readonly bufferedReplayItems: TranscriptTimelineItem[] = [];
   private restarting = false;
   private closed = false;
   private opened = false;
@@ -248,6 +252,7 @@ export class Session {
       this.pendingPrompt === null &&
       this.starting === null &&
       !this.configuring &&
+      !this.hasRunningTools() &&
       this.pendingPermissions.size === 0
     );
   }
@@ -302,6 +307,7 @@ export class Session {
         canceled: false,
         completion: completion.promise,
         resolve: completion.resolve,
+        activity: Promise.withResolvers<void>(),
       };
       this.activeTurn = turn;
       this.messages.clear();
@@ -353,17 +359,37 @@ export class Session {
             "Antigravity stopped: " + response.stopReason,
             "TURN_LIMIT",
           );
-        this.finishRunningTools(canceled ? "canceled" : "completed");
+        if (!canceled) await this.waitForTurnTools(turn);
+        if (this.activeTurn !== turn) return;
+        await this.retireTurnClient(client);
+        if (this.activeTurn !== turn) return;
+        if (turn.canceled || canceled) this.finishRunningTools("canceled");
+        else if (this.hasRunningTools())
+          throw new AntigravityError(
+            "Antigravity started an unfinished tool after end_turn",
+            "INVALID_TURN_BOUNDARY",
+          );
         this.emit({
           type: "session.turn",
           sessionId: this.options.id,
           turnId: turn.id,
-          state: canceled ? "canceled" : "completed",
+          state: turn.canceled || canceled ? "canceled" : "completed",
         });
       } catch (error) {
         if (this.activeTurn !== turn) return;
+        let failure = error;
+        try {
+          await this.retireTurnClient(client);
+        } catch (closeError) {
+          failure = new AggregateError(
+            [error, closeError],
+            "Antigravity turn and runtime teardown failed",
+          );
+        }
+        if (this.activeTurn !== turn) return;
         this.finishRunningTools(turn.canceled ? "canceled" : "failed");
-        const message = error instanceof Error ? error.message : String(error);
+        const message =
+          failure instanceof Error ? failure.message : String(failure);
         this.emit({
           type: "session.turn",
           sessionId: this.options.id,
@@ -377,11 +403,51 @@ export class Session {
         if (this.activeTurn === turn) this.activeTurn = null;
         this.cancelPendingPermissions();
         this.fallbackChunkIds.clear();
+        turn.activity.resolve();
         turn.resolve();
       }
     } finally {
       if (this.pendingPrompt === admission) this.pendingPrompt = null;
     }
+  }
+
+  private async waitForTurnTools(turn: ActiveTurn): Promise<void> {
+    const deadline = AbortSignal.timeout(30000);
+    while (
+      this.activeTurn === turn &&
+      !turn.canceled &&
+      this.hasRunningTools()
+    ) {
+      turn.activity = Promise.withResolvers<void>();
+      await new Promise<void>((resolve, reject) => {
+        const abort = () =>
+          reject(
+            new AntigravityError(
+              "Antigravity returned end_turn before its tools settled",
+              "TURN_DRAIN_TIMEOUT",
+            ),
+          );
+        deadline.addEventListener("abort", abort, { once: true });
+        if (deadline.aborted) abort();
+        void turn.activity.promise.then(() => {
+          deadline.removeEventListener("abort", abort);
+          resolve();
+        });
+      });
+    }
+  }
+
+  private hasRunningTools(): boolean {
+    return [...this.toolCalls.values()].some(
+      (tool) => tool.status === "pending" || tool.status === "in_progress",
+    );
+  }
+
+  private async retireTurnClient(client: AcpClient): Promise<void> {
+    // ACP updates identify a session, not a turn. EOF closes the old stream before
+    // publishing completion, so an unlabelled late update cannot belong to the next prompt.
+    await client.close();
+    if (this.client === client) this.client = null;
   }
 
   async configure(changes: ProviderConfigChanges): Promise<void> {
@@ -593,6 +659,7 @@ export class Session {
     const client = this.client;
     if (!turn || !client || !this.conversationId) return;
     turn.canceled = true;
+    turn.activity.resolve();
     this.cancelPendingPermissions();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
@@ -641,6 +708,7 @@ export class Session {
     }
     if (this.activeTurn) {
       const turnId = this.activeTurn.id;
+      this.activeTurn.activity.resolve();
       this.activeTurn.resolve();
       this.activeTurn = null;
       this.finishRunningTools("canceled");
@@ -680,12 +748,17 @@ export class Session {
   private async createAcpClient(
     historyMode: "replay" | "skip",
   ): Promise<AcpClient> {
-    const client = new AcpClient({
+    const client: AcpClient = new AcpClient({
       launch: this.options.launch,
       cwd: this.config.cwd,
       env: this.mergedEnv,
-      onSessionUpdate: (params) => this.handleSessionUpdate(params),
-      onPermissionRequest: (params) => this.handlePermissionRequest(params),
+      onSessionUpdate: (params) => {
+        if (this.client === client) return this.handleSessionUpdate(params);
+      },
+      onPermissionRequest: (params) =>
+        this.client === client
+          ? this.handlePermissionRequest(params)
+          : Promise.resolve({ outcome: { outcome: "cancelled" } }),
       onExit: (error) => {
         if (this.client === client) this.handleUnexpectedExit(error);
       },
@@ -998,7 +1071,10 @@ export class Session {
     ) {
       return;
     }
-    if (this.replayMode === "skip") {
+    if (
+      this.replayMode === "skip" ||
+      (this.replayMode === "none" && !this.activeTurn)
+    ) {
       this.handleMetaSessionUpdate(params.update);
       return;
     }
@@ -1032,7 +1108,7 @@ export class Session {
       if (
         msgId &&
         this.replayMessageId &&
-        this.replayMessageId !== "user_message_chunk:" + msgId
+        this.replayMessageId !== "history:user_message_chunk:" + msgId
       )
         await this.flushReplayUserChunk();
       const id = this.resolveChunkId("user_message_chunk", msgId);
@@ -1064,7 +1140,7 @@ export class Session {
           ? {
               type: "assistant_message",
               id,
-              messageId: msgId ?? id,
+              messageId: id,
               text,
             }
           : {
@@ -1087,6 +1163,7 @@ export class Session {
       if (merged.kind === "execute" || merged.name === "run_command")
         await this.rewindTracker.recordShellOperation();
       this.toolCalls.set(merged.toolCallId, merged);
+      this.activeTurn?.activity.resolve();
 
       if (merged.status === "pending" || merged.status === "in_progress") {
         for (const filePath of extractModifiedFilePaths(merged)) {
@@ -1137,7 +1214,7 @@ export class Session {
 
   private async replayTranscriptHistory(): Promise<void> {
     if (!this.conversationId) return;
-    let items: ProviderTimelineItem[] = [];
+    let items: TranscriptTimelineItem[] = [];
     try {
       items = await readTranscriptTimeline(this.conversationId, this.mergedEnv);
     } catch {
@@ -1340,6 +1417,7 @@ export class Session {
     this.cancelPendingPermissions();
     if (this.activeTurn) {
       const turnId = this.activeTurn.id;
+      this.activeTurn.activity.resolve();
       this.activeTurn.resolve();
       this.activeTurn = null;
       this.finishRunningTools("failed");
@@ -1379,14 +1457,11 @@ export class Session {
     this.pendingPermissions.clear();
   }
 
-  private finishRunningTools(
-    status: "completed" | "failed" | "canceled",
-  ): void {
+  private finishRunningTools(status: "failed" | "canceled"): void {
     for (const [id, state] of this.toolCalls.entries()) {
       if (state.status !== "pending" && state.status !== "in_progress")
         continue;
-      const nextStatus = status === "completed" ? "completed" : "failed";
-      this.toolCalls.set(id, { ...state, status: nextStatus });
+      this.toolCalls.set(id, { ...state, status: "failed" });
       const item = acpToolToTimelineItem(state);
       if (status === "failed") {
         this.emitItem({
@@ -1403,11 +1478,11 @@ export class Session {
   private resolveChunkId(kind: string, messageId?: string): string {
     if (messageId) {
       this.fallbackChunkIds.delete(kind);
-      return `${kind}:${messageId}`;
+      return `${this.activeTurn?.id ?? "history"}:${kind}:${messageId}`;
     }
     let id = this.fallbackChunkIds.get(kind);
     if (!id) {
-      id = `${kind}:${++this.chunkSequence}`;
+      id = `${this.activeTurn?.id ?? "history"}:${kind}:${++this.chunkSequence}`;
       this.fallbackChunkIds.set(kind, id);
     }
     return id;
@@ -1552,8 +1627,18 @@ export class Session {
     this.emitItem(item);
   }
 
-  private emitItem(item: ProviderTimelineItem): void {
-    this.emit({ type: "timeline.item", sessionId: this.options.id, item });
+  private emitItem(item: TranscriptTimelineItem): void {
+    const { timestamp, ...timelineItem } = item;
+    if (timelineItem.type === "tool_call" && this.activeTurn) {
+      timelineItem.id = this.activeTurn.id + ":" + timelineItem.id;
+      timelineItem.callId = this.activeTurn.id + ":" + timelineItem.callId;
+    }
+    this.emit({
+      type: "timeline.item",
+      sessionId: this.options.id,
+      item: timelineItem,
+      timestamp,
+    });
   }
 
   private emit(event: ProviderEvent): void {

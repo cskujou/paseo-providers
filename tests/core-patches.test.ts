@@ -53,6 +53,13 @@ const coreLines = [
   "        });",
   "    }",
   "",
+  "        onEvent: (listener) => connection.onEvent((event) => listener(ProviderEventSchema.parse(event))),",
+  "    async listImportableSessions() {",
+  "        return sessions.map((session) => ({",
+  "            firstPromptPreview: null,",
+  "            lastPromptPreview: session.description ?? null,",
+  "        }));",
+  "    }",
 ];
 const corePath = "server/agent/plugin-provider.js";
 
@@ -66,6 +73,12 @@ describe("core patches", () => {
     expect(patched).toContain("this.history.length = index;");
     expect(patched).toContain("this.timelineSnapshots.clear();");
     expect(patched).not.toContain("revertTokens.set(item.clientMessageId");
+    expect(patched).toContain(
+      "firstPromptPreview: session.firstPromptPreview ?? null",
+    );
+    expect(patched).toContain(
+      "lastPromptPreview: session.lastPromptPreview ?? session.description ?? null",
+    );
     const second = await run(root);
     expect(second.code).toBe(0);
     expect(second.output).toContain("already patched");
@@ -79,6 +92,19 @@ describe("core patches", () => {
     const result = await run(root);
     expect(result.code).toBe(1);
     expect(result.output).toContain("Could not find PluginAgentSession.revert");
+  });
+
+  it("fails without modifying the host when its summary mapping no longer matches", async () => {
+    const changed = coreLines
+      .join("\n")
+      .replace("firstPromptPreview: null,", "firstPromptPreview: otherValue,");
+    const root = await fakeServer({ [corePath]: changed });
+    const result = await run(root);
+    expect(result.code).toBe(1);
+    expect(result.output).toContain(
+      "Could not find PluginAgentClient session summary mapping",
+    );
+    expect(await readFile(path.join(root, corePath), "utf8")).toBe(changed);
   });
 
   it("fails loudly when the plugin host file is missing", async () => {

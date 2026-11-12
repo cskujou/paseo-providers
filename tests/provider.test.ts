@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   ProviderEvent,
   ProviderInput,
@@ -253,6 +253,267 @@ describe("Antigravity provider public contract", () => {
         .map((event) => event.state),
     ).toEqual(["started", "canceled", "started", "completed"]);
   });
+  it("rejects unsupported structured output and exact MCP preapproval instead of ignoring them", async () => {
+    const h = await harness();
+    await h.open();
+    await expect(
+      h.connection.send({
+        type: "session.prompt",
+        sessionId: "s",
+        prompt: {
+          clientMessageId: "schema",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "test" }] },
+          outputSchema: { type: "object" },
+        },
+      }),
+    ).rejects.toThrow("prompt.output_schema");
+    await expect(
+      h.connection.send({
+        type: "session.open",
+        sessionId: "policy",
+        requestId: "policy",
+        history: "skip",
+        config: {
+          cwd: h.cwd,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: false,
+          toolPolicy: {
+            preapproved: [{ kind: "mcp", server: "fixture", tool: "tool" }],
+          },
+        },
+      }),
+    ).rejects.toThrow("permission.tool_policy");
+    expect(h.events.filter((event) => event.type === "session.turn")).toEqual(
+      [],
+    );
+  });
+
+  it("waits for a running tool after early end_turn instead of inventing completion", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("first", "early-end");
+    await h.wait(
+      "timeline.item",
+      (event) =>
+        event.item.type === "tool_call" && event.item.status === "running",
+    );
+    await h.connection.send({
+      type: "session.can_stop_runtime",
+      sessionId: "s",
+      requestId: "busy",
+    });
+    expect(
+      (
+        await h.wait(
+          "session.can_stop_runtime",
+          (event) => event.requestId === "busy",
+        )
+      ).canStop,
+    ).toBe(false);
+    await h.prompt("blocked", "next");
+    expect(
+      (
+        await h.wait(
+          "session.prompt_result",
+          (event) => event.clientMessageId === "blocked",
+        )
+      ).result.type,
+    ).toBe("failed");
+    await h.wait("session.turn", (event) => event.state === "completed");
+    const order = h.events.filter(
+      (event) =>
+        event.type === "timeline.item" || event.type === "session.turn",
+    );
+    const thought = order.findIndex(
+      (event) =>
+        event.type === "timeline.item" &&
+        event.item.type === "reasoning" &&
+        event.item.text === "old-turn-thought",
+    );
+    const toolDone = order.findIndex(
+      (event) =>
+        event.type === "timeline.item" &&
+        event.item.type === "tool_call" &&
+        event.item.status === "completed",
+    );
+    const ended = order.findIndex(
+      (event) => event.type === "session.turn" && event.state === "completed",
+    );
+    expect(thought).toBeGreaterThan(-1);
+    expect(toolDone).toBeGreaterThan(thought);
+    expect(ended).toBeGreaterThan(toolDone);
+    expect(
+      h.events
+        .filter((event) => event.type === "timeline.item")
+        .filter((event) => event.item.type === "tool_call")
+        .map((event) =>
+          event.item.type === "tool_call" ? event.item.status : "",
+        ),
+    ).toEqual(["running", "completed"]);
+    await h.prompt("second", "reuse-identities");
+    await h.wait(
+      "session.turn",
+      (event) =>
+        event.state === "completed" &&
+        event.turnId !==
+          h.events.find((event) => event.type === "session.turn")?.turnId,
+    );
+    const ids = h.events
+      .filter((event) => event.type === "timeline.item")
+      .filter((event) => event.item.type === "tool_call")
+      .map((event) => event.item.id);
+    expect(ids.at(-1)).not.toBe(ids[0]);
+  });
+
+  it("settles a tool-draining turn once if its ACP process exits", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("first", "early-end-exit");
+    await h.wait("session.turn", (event) => event.state === "failed");
+    expect(
+      h.events
+        .filter((event) => event.type === "session.turn")
+        .map((event) => event.state),
+    ).toEqual(["started", "failed"]);
+    await h.prompt("second", "next");
+    await h.wait("session.turn", (event) => event.state === "completed");
+    expect(
+      h.events
+        .filter((event) => event.type === "session.turn")
+        .map((event) => event.state),
+    ).toEqual(["started", "failed", "started", "completed"]);
+  });
+
+  it("fails a bounded tool drain instead of reporting unfinished work as completed", async () => {
+    const h = await harness();
+    await h.open();
+    const controller = new AbortController();
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockReturnValue(controller.signal);
+    try {
+      await h.prompt("first", "early-end-hold");
+      await h.wait(
+        "timeline.item",
+        (event) =>
+          event.item.type === "tool_call" && event.item.status === "running",
+      );
+      // A control round-trip proves the early response was read and its drain started.
+      await h.connection.send({
+        type: "session.can_stop_runtime",
+        sessionId: "s",
+        requestId: "draining",
+      });
+      await h.wait(
+        "session.can_stop_runtime",
+        (event) => event.requestId === "draining",
+      );
+      controller.abort();
+      const failed = await h.wait(
+        "session.turn",
+        (event) => event.state === "failed",
+      );
+      expect(failed.error?.message).toContain("before its tools settled");
+      expect(
+        h.events
+          .filter((event) => event.type === "session.turn")
+          .map((event) => event.state),
+      ).toEqual(["started", "failed"]);
+      expect(
+        h.events
+          .filter((event) => event.type === "timeline.item")
+          .filter((event) => event.item.type === "tool_call")
+          .map((event) =>
+            event.item.type === "tool_call" ? event.item.status : "",
+          ),
+      ).toEqual(["running", "failed"]);
+    } finally {
+      timeout.mockRestore();
+    }
+    await h.prompt("second", "next");
+    await h.wait("session.turn", (event) => event.state === "completed");
+  });
+
+  it("cancels a tool drain even when the prompt response already returned", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("first", "early-end-hold");
+    await h.wait(
+      "timeline.item",
+      (event) =>
+        event.item.type === "tool_call" && event.item.status === "running",
+    );
+    await h.connection.send({
+      type: "session.interrupt",
+      sessionId: "s",
+      requestId: "cancel-drain",
+    });
+    await h.wait(
+      "request.completed",
+      (event) => event.requestId === "cancel-drain",
+    );
+    await h.wait("session.turn", (event) => event.state === "canceled");
+    expect(
+      h.events
+        .filter((event) => event.type === "timeline.item")
+        .filter((event) => event.item.type === "tool_call")
+        .map((event) =>
+          event.item.type === "tool_call" ? event.item.status : "",
+        ),
+    ).toEqual(["running", "canceled"]);
+    await h.prompt("second", "next");
+    await h.wait("session.turn", (event) => event.state === "completed");
+  });
+
+  it("retires the previous ACP stream and isolates reused message IDs before admitting the next turn", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("first", "late-after-end");
+    const first = await h.wait(
+      "session.turn",
+      (event) => event.state === "completed",
+    );
+    await h.prompt("second", "reuse-identities");
+    await h.wait(
+      "session.turn",
+      (event) => event.state === "completed" && event.turnId !== first.turnId,
+    );
+    const assistant = h.events
+      .filter((event) => event.type === "timeline.item")
+      .filter((event) => event.item.type === "assistant_message");
+    expect(
+      assistant.map((event) =>
+        event.item.type === "assistant_message" ? event.item.text : "",
+      ),
+    ).toEqual(["first answer", "new answer"]);
+    expect(assistant[0]?.item.id).not.toBe(assistant[1]?.item.id);
+    const messageIds = assistant.map((event) =>
+      event.item.type === "assistant_message"
+        ? event.item.messageId
+        : undefined,
+    );
+    expect(messageIds[0]).not.toBe(messageIds[1]);
+    expect(
+      h.events.some(
+        (event) =>
+          event.type === "timeline.item" &&
+          event.item.type === "reasoning" &&
+          event.item.text === "late-old-thought",
+      ),
+    ).toBe(false);
+    expect(
+      h.events
+        .filter((event) => event.type === "timeline.item")
+        .filter((event) => event.item.type === "tool_call")
+        .map((event) =>
+          event.item.type === "tool_call" ? event.item.status : "",
+        ),
+    ).toEqual(["completed"]);
+  });
+
   it("does not advertise steering without a native acknowledgement", async () => {
     const h = await harness();
     expect(h.connection.capabilities.includes("prompt.steer")).toBe(false);
@@ -320,6 +581,81 @@ describe("Antigravity provider public contract", () => {
       "matching title",
     ]);
   });
+  it("uses the first prompt as an untitled session's title", async () => {
+    const h = await harness();
+    const logs = path.join(
+      h.cwd,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "unrelated",
+      ".system_generated",
+      "logs",
+    );
+    await mkdir(logs, { recursive: true });
+    await writeFile(
+      path.join(logs, "transcript_full.jsonl"),
+      JSON.stringify({ type: "USER_INPUT", content: "Untitled prompt" }),
+    );
+    await h.connection.send({
+      type: "sessions",
+      requestId: "list",
+      query: "Untitled prompt",
+      limit: 1,
+    });
+    const listed = await h.wait("sessions");
+    expect(listed.sessions[0]).toMatchObject({
+      title: "Untitled prompt",
+      description: "Untitled prompt",
+      firstPromptPreview: "Untitled prompt",
+      lastPromptPreview: "Untitled prompt",
+    });
+  });
+
+  it("searches local prompt summaries before applying the session-list limit", async () => {
+    const h = await harness();
+    const logs = path.join(
+      h.cwd,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "matching",
+      ".system_generated",
+      "logs",
+    );
+    await mkdir(logs, { recursive: true });
+    await writeFile(
+      path.join(logs, "transcript_full.jsonl"),
+      [
+        JSON.stringify({
+          type: "USER_INPUT",
+          content:
+            "<USER_REQUEST> First request </USER_REQUEST><ADDITIONAL_METADATA>hidden</ADDITIONAL_METADATA>",
+        }),
+        JSON.stringify({ type: "PLANNER_RESPONSE", content: "not a preview" }),
+        JSON.stringify({
+          type: "USER_INPUT",
+          content: "latest\nrequest needle",
+        }),
+      ].join("\n"),
+    );
+    await h.connection.send({
+      type: "sessions",
+      requestId: "list",
+      query: "needle",
+      limit: 1,
+    });
+    const listed = await h.wait("sessions");
+    expect(listed.sessions).toHaveLength(1);
+    expect(listed.sessions[0]).toMatchObject({
+      title: "matching title",
+      description: "latest request needle",
+      firstPromptPreview: "First request",
+      lastPromptPreview: "latest request needle",
+      updatedAt: expect.any(String),
+    });
+  });
+
   it("reports session-list errors instead of returning an empty success", async () => {
     const h = await harness({ FIXTURE_FAIL_LIST: "1" });
     await h.connection.send({ type: "sessions", requestId: "list" });
