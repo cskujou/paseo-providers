@@ -8,7 +8,5 @@ export default function contribute(
   const usage = new AntigravityUsage();
   server.registerUsageSource(usage.registration());
   server.registerProvider(createAntigravityProvider(usage));
-  return () => {
-    usage.close();
-  };
+  return () => usage.close();
 }

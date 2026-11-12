@@ -16,7 +16,7 @@ paseo-providers/
 ├── templates/
 │   └── provider-template/                    # 新建自定义 Provider 的标准脚手架模板（./install.sh --new 自动调用）
 └── providers/
-    ├── antigravity-provider/                 # [已内置] 完整版 Antigravity ACP Provider + 4 窗口额度监控
+    ├── antigravity-provider/                 # [已内置] Antigravity ACP Provider + 4 窗口额度监控
     │   ├── paseo-plugin.json
     │   ├── icon.svg
     │   ├── index.server.ts
@@ -28,7 +28,8 @@ paseo-providers/
     │           ├── catalog.ts
     │           ├── rewind.ts
     │           ├── session.ts
-    │           └── timeline.ts
+    │           ├── timeline.ts
+    │           └── transcript-history.ts
     └── <your-next-provider>/                 # 后续新增的任意自定义 Provider
 ```
 
@@ -43,7 +44,41 @@ paseo-providers/
    - 若 `providers/<plugin-id>` 与 Paseo 原生内置插件同名（例如 `antigravity-provider`、`hoplite-provider`、`muse-provider`），安装时会自动备份原版并覆盖。
    - 若 `providers/<plugin-id>` 是你新写的全新插件（例如 `deepseek-provider`），`patches/apply-core-patches.mjs` 会自动将其追加注册进 Paseo 的 `server/plugins/builtin/index.js` (`builtinPlugins` 列表) 中，使其随 Paseo Daemon 启动自动加载，无需手动逐台机器执行 `paseo plugin install`。
 3. **安装时自动通过 Paseo 官方编译器预检**：
-   - 每次执行 `./install.sh` 时，都会调用目标机器上 Paseo 自带的 `compileDirectoryPlugin` 编译器对每个已安装的 Provider 进行打包与类型边界校验，确保不会因为语法错误导致 Daemon 启动失败。
+   - 每次执行 `./install.sh` 时，都会调用目标机器上 Paseo 自带的 `compileDirectoryPlugin` 编译器对每个已安装的 Provider 进行打包与模块边界校验，确保不会因为语法错误导致 Daemon 启动失败。
+
+---
+
+## Antigravity provider
+
+需要 Paseo 0.14.0 或更新版本，以及 Node.js 24.9.0 或更新版本。接入已用本机 agy 1.5.6 验证；额度采集在 POSIX 系统使用 Python 3 的 PTY 模块。
+
+- 从 agy CLI 获取模型目录，从 ACP 会话读取实际模型、模式、思考等级和自定义选择项。
+- 支持消息、斜杠命令、图片、文本附件、上传文件路径、MCP 配置、交互权限和取消当前回合。
+- 支持会话列表分页、导入、持久化恢复和有序历史重放。ACP 没有发送历史时，读取本地转录文件。
+- 提供对话、文件和两者同时回退。文件检查点保存在 agy 数据目录的 `paseo-rewind/` 中，可跨进程恢复；对话截断前保留数据库副本。
+- 显示四个额度窗口。刷新失败时报错，不把过期缓存显示为当前额度。
+
+### 回退范围与限制
+
+**文件回退会覆盖目标回合之后的工作区改动，包括手动改动。** Git 快照覆盖整个工作树中的非忽略文件，不仅是当前目录；不改动 HEAD 和真实 Git 索引。快照使用临时索引和私有 Git 引用，避免修改原有暂存状态，并防止快照对象被垃圾回收。
+
+非 Git 工作区依赖 ACP 提供的文件路径和修改前内容。无法覆盖的 shell 改动、超过 10 MiB 的文件、读取失败或缺失检查点都会明确拒绝文件回退。安装前已有的历史没有文件检查点，不能追补文件回退。
+
+对话回退和转录恢复依赖 agy 的本地数据格式及默认数据目录；自定义数据路径、其他 CLI 版本和跨平台行为需要另行验证。文件恢复和数据库截断不是跨资源原子事务。
+
+ACP 没有可靠的 steer 接受确认，因此不宣告 `prompt.steer`。也不宣告结构化输出、原生归档或独立子会话能力；CLI 的 print 模式支持某项功能，不代表 ACP 支持。Full access 自动批准工具权限，但多选项问题仍需明确选择。
+
+### 本地开发检查
+
+```bash
+npm ci --ignore-scripts
+npm test
+npm run typecheck
+npm run lint
+npm run format:check
+```
+
+测试使用受控 ACP 子进程、临时文件系统、Git 仓库和 SQLite 数据库，不加载个人会话或调用模型 API。安装命令会修改 Paseo 的插件目录；加上 `--restart` 会终止运行中的会话，确认后再执行。
 
 ---
 

@@ -15,7 +15,7 @@ export interface AcpToolCallState {
   locations: string[];
   diff?: {
     path?: string;
-    oldText?: string;
+    oldText?: string | null;
     newText?: string;
   };
   textContent?: string;
@@ -36,11 +36,14 @@ export function mergeAcpToolCall(
   update: Record<string, unknown>,
   previous?: AcpToolCallState,
 ): AcpToolCallState {
-  const toolCallId = asString(update.toolCallId) ?? previous?.toolCallId ?? "tool";
+  const toolCallId =
+    asString(update.toolCallId) ?? previous?.toolCallId ?? "tool";
   const name = asString(update.name) ?? previous?.name;
-  const title = asString(update.title) ?? previous?.title ?? name ?? "Antigravity tool";
+  const title =
+    asString(update.title) ?? previous?.title ?? name ?? "Antigravity tool";
   const kind = asString(update.kind) ?? previous?.kind;
-  const rawStatus = asString(update.status) ?? previous?.status ?? "in_progress";
+  const rawStatus =
+    asString(update.status) ?? previous?.status ?? "in_progress";
   const status: AcpToolCallState["status"] =
     rawStatus === "pending" ||
     rawStatus === "in_progress" ||
@@ -50,10 +53,14 @@ export function mergeAcpToolCall(
       : "in_progress";
 
   const rawInput = (
-    update.rawInput !== undefined ? update.rawInput : (previous?.rawInput ?? null)
+    update.rawInput !== undefined
+      ? update.rawInput
+      : (previous?.rawInput ?? null)
   ) as JsonValue;
   const rawOutput = (
-    update.rawOutput !== undefined ? update.rawOutput : (previous?.rawOutput ?? null)
+    update.rawOutput !== undefined
+      ? update.rawOutput
+      : (previous?.rawOutput ?? null)
   ) as JsonValue;
 
   let locations = previous?.locations ?? [];
@@ -72,8 +79,12 @@ export function mergeAcpToolCall(
       if (rec.type === "diff") {
         diff = {
           path: asString(rec.path) ?? diff?.path,
-          oldText: typeof rec.oldText === "string" ? rec.oldText : diff?.oldText,
-          newText: typeof rec.newText === "string" ? rec.newText : diff?.newText,
+          oldText:
+            typeof rec.oldText === "string" || rec.oldText === null
+              ? rec.oldText
+              : diff?.oldText,
+          newText:
+            typeof rec.newText === "string" ? rec.newText : diff?.newText,
         };
       } else if (rec.type === "content") {
         const inner = asRecord(rec.content);
@@ -105,13 +116,23 @@ export function mergeAcpToolCall(
 
 export function extractModifiedFilePaths(state: AcpToolCallState): string[] {
   const paths = new Set<string>();
+  const lowerName = (state.name ?? state.title).toLowerCase();
+  const modifiesFiles =
+    ["edit", "delete", "move"].includes(state.kind ?? "") ||
+    /edit|write|replace|delete|move/.test(lowerName);
+  if (!modifiesFiles && !state.diff) return [];
   const input = asRecord(state.rawInput);
-  for (const key of ["Path", "AbsolutePath", "TargetFile", "filePath", "path"]) {
+  for (const key of [
+    "Path",
+    "AbsolutePath",
+    "TargetFile",
+    "filePath",
+    "path",
+  ]) {
     const val = asString(input[key]);
     if (val) paths.add(val);
   }
   if (state.diff?.path) paths.add(state.diff.path);
-  const lowerName = (state.name ?? state.title).toLowerCase();
   if (
     state.kind === "edit" ||
     lowerName.includes("edit") ||
@@ -157,15 +178,17 @@ export function acpToolToTimelineItem(
   };
 }
 
-export function buildToolDetail(state: AcpToolCallState): ProviderToolCallDetail {
+export function buildToolDetail(
+  state: AcpToolCallState,
+): ProviderToolCallDetail {
   const input = asRecord(state.rawInput);
   const outputStr =
     typeof state.rawOutput === "string"
       ? state.rawOutput
-      : state.textContent ??
+      : (state.textContent ??
         (state.rawOutput !== null && state.rawOutput !== undefined
           ? JSON.stringify(state.rawOutput)
-          : undefined);
+          : undefined));
 
   const filePath =
     asString(input.Path) ??
@@ -202,9 +225,14 @@ export function buildToolDetail(state: AcpToolCallState): ProviderToolCallDetail
       return {
         type: "edit",
         filePath,
-        oldString: state.diff?.oldText ?? asString(input.Target) ?? asString(input.TargetContent),
+        oldString:
+          state.diff?.oldText ??
+          asString(input.Target) ??
+          asString(input.TargetContent),
         newString:
-          state.diff?.newText ?? asString(input.Replacement) ?? asString(input.ReplacementContent),
+          state.diff?.newText ??
+          asString(input.Replacement) ??
+          asString(input.ReplacementContent),
       };
     }
   }
@@ -219,7 +247,11 @@ export function buildToolDetail(state: AcpToolCallState): ProviderToolCallDetail
     }
   }
 
-  if (state.kind === "read" || lowerName === "read_file" || lowerName === "view_file") {
+  if (
+    state.kind === "read" ||
+    lowerName === "read_file" ||
+    lowerName === "view_file"
+  ) {
     if (filePath) {
       return {
         type: "read",
@@ -258,8 +290,10 @@ export function buildToolDetail(state: AcpToolCallState): ProviderToolCallDetail
   if (lowerName === "invoke_subagent" || lowerName.includes("subagent")) {
     return {
       type: "sub_agent",
-      subAgentType: asString(input.TypeName) ?? asString(input.Role) ?? "subagent",
-      description: asString(input.Prompt) ?? asString(input.Role) ?? state.title,
+      subAgentType:
+        asString(input.TypeName) ?? asString(input.Role) ?? "subagent",
+      description:
+        asString(input.Prompt) ?? asString(input.Role) ?? state.title,
       log: outputStr ?? "",
     };
   }

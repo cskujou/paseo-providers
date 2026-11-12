@@ -1,4 +1,6 @@
 import os from "node:os";
+import { createHash } from "node:crypto";
+import { z } from "zod";
 import { execCommand } from "@getpaseo/plugin/server";
 import {
   negotiateProviderCapabilities,
@@ -8,12 +10,16 @@ import {
   type ProviderEvent,
   type ProviderInput,
   type ProviderLaunch,
-  type ProviderListedSession,
+  type ProviderSessionSummary,
   type ProviderRegistration,
   type ProviderStatus,
 } from "@getpaseo/plugin/server/provider";
-import { AcpClient, AntigravityError, formatDiagnostic } from "./internal/acp-client.js";
-import { fallbackCatalog } from "./internal/catalog.js";
+import {
+  AcpClient,
+  AntigravityError,
+  formatDiagnostic,
+} from "./internal/acp-client.js";
+import { catalogFromModelOutput, fallbackCatalog } from "./internal/catalog.js";
 import { Session } from "./internal/session.js";
 import type { AntigravityUsage } from "./usage.js";
 
@@ -21,7 +27,6 @@ const capabilities = [
   "prompt.message",
   "prompt.command",
   "prompt.image",
-  "prompt.steer",
   "session.can_stop_runtime",
   "session.configure",
   "session.list",
@@ -32,7 +37,9 @@ const capabilities = [
   "permission",
 ] as const;
 
-export function createAntigravityProvider(usage?: AntigravityUsage): ProviderRegistration {
+export function createAntigravityProvider(
+  usage?: AntigravityUsage,
+): ProviderRegistration {
   return {
     id: "antigravity",
     label: "Antigravity",
@@ -43,13 +50,21 @@ export function createAntigravityProvider(usage?: AntigravityUsage): ProviderReg
     async getCatalogCacheKey({ launch }) {
       if (!launch) return "agy-acp-v2";
       usage?.remember(launch);
-      return `${launch.command}:${launch.args.join("\0")}:acp-v2`;
+      const environment = Object.entries(launch.env).sort(([left], [right]) =>
+        left.localeCompare(right),
+      );
+      return createHash("sha256")
+        .update(
+          JSON.stringify([launch.command, launch.args, environment, "acp-v3"]),
+        )
+        .digest("hex");
     },
     async status({ launch }) {
       if (!launch) {
         return {
           available: false,
-          diagnostic: "Install the Antigravity CLI and ensure `agy` is on PATH.",
+          diagnostic:
+            "Install the Antigravity CLI and ensure `agy` is on PATH.",
         };
       }
       usage?.remember(launch);
@@ -69,7 +84,10 @@ export function createAntigravityProvider(usage?: AntigravityUsage): ProviderReg
         );
       }
       usage?.remember(request.launch);
-      const negotiated = negotiateProviderCapabilities(request.capabilities, capabilities);
+      const negotiated = negotiateProviderCapabilities(
+        request.capabilities,
+        capabilities,
+      );
       return createConnection(request.launch, negotiated, usage);
     },
   };
@@ -77,10 +95,14 @@ export function createAntigravityProvider(usage?: AntigravityUsage): ProviderReg
 
 async function checkStatus(launch: ProviderLaunch): Promise<ProviderStatus> {
   try {
-    const { stdout } = await execCommand(launch.command, [...launch.args, "--version"], {
-      env: launch.env,
-      timeout: 5000,
-    });
+    const { stdout } = await execCommand(
+      launch.command,
+      [...launch.args, "--version"],
+      {
+        env: launch.env,
+        timeout: 5000,
+      },
+    );
     if (!/\b\d+\.\d+\.\d+\b/.test(stdout)) {
       return {
         available: false,
@@ -97,53 +119,74 @@ async function checkStatus(launch: ProviderLaunch): Promise<ProviderStatus> {
 async function listAcpSessions(
   launch: ProviderLaunch,
   input: Extract<ProviderInput, { type: "sessions" }>,
-): Promise<ProviderListedSession[]> {
-  const cwd = input.cwd ?? os.homedir();
+): Promise<ProviderSessionSummary[]> {
   const client = new AcpClient({
     launch,
-    cwd,
+    cwd: input.cwd ?? os.homedir(),
     startupTimeoutMs: 10000,
+  });
+  const pageSchema = z.object({
+    sessions: z.array(
+      z.object({
+        sessionId: z.string().min(1),
+        cwd: z.string(),
+        title: z.string().optional(),
+        updatedAt: z.string().optional(),
+      }),
+    ),
+    nextCursor: z.string().nullable().optional(),
   });
   try {
     await client.initialize();
-    const res = await client.request<Record<string, unknown>>(
-      "session/list",
-      { cwd },
-      15000,
-    );
-    const rawSessions = Array.isArray(res.sessions) ? res.sessions : [];
-    const mapped: ProviderListedSession[] = [];
-    for (const entry of rawSessions) {
-      if (typeof entry !== "object" || entry === null) continue;
-      const rec = entry as Record<string, unknown>;
-      const sessionId = typeof rec.sessionId === "string" ? rec.sessionId : "";
-      if (!sessionId) continue;
-      const sessionCwd = typeof rec.cwd === "string" ? rec.cwd : cwd;
-      const title = typeof rec.title === "string" ? rec.title : undefined;
-      const updatedAt = typeof rec.updatedAt === "string" ? rec.updatedAt : undefined;
-      if (
-        input.query &&
-        title &&
-        !title.toLowerCase().includes(input.query.toLowerCase()) &&
-        !sessionId.toLowerCase().includes(input.query.toLowerCase())
-      ) {
-        continue;
+    const mapped: ProviderSessionSummary[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    const query = input.query?.toLowerCase();
+    do {
+      const page = pageSchema.parse(
+        await client.request(
+          "session/list",
+          {
+            ...(input.cwd ? { cwd: input.cwd } : {}),
+            ...(cursor ? { cursor } : {}),
+          },
+          15000,
+        ),
+      );
+      for (const session of page.sessions) {
+        if (
+          query &&
+          ![session.title ?? "", session.sessionId].some((value) =>
+            value.toLowerCase().includes(query),
+          )
+        )
+          continue;
+        mapped.push({
+          persistence: {
+            version: 1,
+            data: {
+              conversationId: session.sessionId,
+              sessionId: session.sessionId,
+            },
+          },
+          cwd: session.cwd,
+          title: session.title,
+          updatedAt: session.updatedAt,
+        });
+        if (input.limit !== undefined && mapped.length >= input.limit)
+          return mapped.slice(0, input.limit);
       }
-      mapped.push({
-        persistence: {
-          version: 1,
-          data: { conversationId: sessionId, sessionId },
-        },
-        cwd: sessionCwd,
-        title,
-        updatedAt,
-      });
-    }
-    return input.limit ? mapped.slice(0, input.limit) : mapped;
-  } catch {
-    return [];
+      cursor = page.nextCursor ?? undefined;
+      if (cursor && cursors.has(cursor))
+        throw new AntigravityError(
+          "Antigravity repeated a session-list cursor",
+          "INVALID_SESSION_PAGE",
+        );
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    return mapped;
   } finally {
-    await client.close().catch(() => undefined);
+    await client.close();
   }
 }
 
@@ -154,17 +197,10 @@ function createConnection(
 ): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
   const sessions = new Map<string, Session>();
-  const currentCatalog: ProviderCatalog = fallbackCatalog();
+  let currentCatalog: ProviderCatalog = fallbackCatalog();
   let closed = false;
 
-  const usageFallback =
-    usage ??
-    ({
-      recordTier() {},
-      remember() {
-        return { home: os.homedir() };
-      },
-    } as unknown as AntigravityUsage);
+  const usageFallback = usage ?? { recordTier() {} };
 
   function emit(event: ProviderEvent): void {
     if (closed) return;
@@ -175,6 +211,12 @@ function createConnection(
 
   async function dispatch(input: ProviderInput): Promise<void> {
     if (input.type === "catalog") {
+      const { stdout } = await execCommand(
+        launch.command,
+        [...launch.args, "models"],
+        { env: launch.env, cwd: input.cwd, timeout: 15000 },
+      );
+      currentCatalog = catalogFromModelOutput(stdout);
       emit({
         type: "catalog",
         requestId: input.requestId,
@@ -195,7 +237,10 @@ function createConnection(
 
     if (input.type === "session.open") {
       if (sessions.has(input.sessionId)) {
-        throw new AntigravityError("Antigravity session is already open", "SESSION_EXISTS");
+        throw new AntigravityError(
+          "Antigravity session is already open",
+          "SESSION_EXISTS",
+        );
       }
       const session = new Session({
         id: input.sessionId,
@@ -211,7 +256,8 @@ function createConnection(
       try {
         await session.open(input.requestId, negotiated);
       } catch (error) {
-        sessions.delete(input.sessionId);
+        if (sessions.get(input.sessionId) === session)
+          sessions.delete(input.sessionId);
         await session.close();
         throw error;
       }
@@ -227,7 +273,10 @@ function createConnection(
 
     const session = sessions.get(input.sessionId);
     if (!session) {
-      throw new AntigravityError("Antigravity session is not open", "UNKNOWN_SESSION");
+      throw new AntigravityError(
+        "Antigravity session is not open",
+        "UNKNOWN_SESSION",
+      );
     }
 
     switch (input.type) {
@@ -265,15 +314,17 @@ function createConnection(
         return;
       default:
         throw new AntigravityError(
-          `Antigravity does not support ${input.type}`,
+          "Antigravity does not support this input",
           "UNSUPPORTED_INPUT",
         );
     }
   }
 
   function handleDispatchError(input: ProviderInput, failure: unknown): void {
-    const rawMessage = failure instanceof Error ? failure.message : String(failure);
-    const code = failure instanceof AntigravityError ? failure.code : "ANTIGRAVITY_ERROR";
+    const rawMessage =
+      failure instanceof Error ? failure.message : String(failure);
+    const code =
+      failure instanceof AntigravityError ? failure.code : "ANTIGRAVITY_ERROR";
     const error = { message: formatDiagnostic(rawMessage), code };
 
     if (input.type === "session.prompt") {
@@ -286,7 +337,11 @@ function createConnection(
     } else if ("requestId" in input) {
       emit({ type: "request.failed", requestId: input.requestId, error });
     } else if ("sessionId" in input) {
-      emit({ type: "session.runtime_failed", sessionId: input.sessionId, error });
+      emit({
+        type: "session.runtime_failed",
+        sessionId: input.sessionId,
+        error,
+      });
     }
   }
 
@@ -295,12 +350,17 @@ function createConnection(
     capabilities: negotiated,
     async send(input) {
       if (closed) {
-        throw new AntigravityError("Antigravity connection is closed", "CONNECTION_CLOSED");
+        throw new AntigravityError(
+          "Antigravity connection is closed",
+          "CONNECTION_CLOSED",
+        );
       }
       requireProviderCapabilities(negotiated, input);
       queueMicrotask(() => {
         if (!closed) {
-          void dispatch(input).catch((err: unknown) => handleDispatchError(input, err));
+          void dispatch(input).catch((err: unknown) =>
+            handleDispatchError(input, err),
+          );
         }
       });
     },
@@ -313,8 +373,18 @@ function createConnection(
       closed = true;
       const openSessions = [...sessions.values()];
       sessions.clear();
-      await Promise.all(openSessions.map((s) => s.close()));
+      const results = await Promise.allSettled(
+        openSessions.map((session) => session.close()),
+      );
       listeners.clear();
+      const failures = results
+        .filter((result) => result.status === "rejected")
+        .map((result) => result.reason);
+      if (failures.length)
+        throw new AggregateError(
+          failures,
+          "Some Antigravity sessions did not close",
+        );
     },
   };
 }

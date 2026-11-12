@@ -2,12 +2,7 @@ import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { spawnProcess, terminateProcess } from "@getpaseo/plugin/server";
 import type { ProviderLaunch } from "@getpaseo/plugin/server/provider";
-
-export interface JsonRpcError {
-  code: number;
-  message: string;
-  data?: unknown;
-}
+import { z } from "zod";
 
 export class AntigravityError extends Error {
   constructor(
@@ -22,48 +17,67 @@ export class AntigravityError extends Error {
 
 export function formatDiagnostic(message: string): string {
   if (/auth|sign.in|log.in|unauthenticated|credential/i.test(message)) {
-    return "Antigravity authentication failed. Run `agy` and sign in, then retry.";
+    return "Antigravity authentication failed. Run agy and sign in, then retry.";
   }
   return message;
 }
 
-export interface AcpPermissionOption {
-  optionId: string;
-  name: string;
-  kind: string;
-}
-
-export interface AcpPermissionRequestParams {
-  sessionId: string;
-  toolCall: Record<string, unknown>;
-  options: AcpPermissionOption[];
-}
-
+const permissionRequestSchema = z.object({
+  sessionId: z.string().min(1),
+  toolCall: z.record(z.string(), z.unknown()),
+  options: z.array(
+    z.object({
+      optionId: z.string().min(1),
+      name: z.string(),
+      kind: z.enum([
+        "allow_once",
+        "allow_always",
+        "reject_once",
+        "reject_always",
+      ]),
+    }),
+  ),
+});
+const sessionUpdateSchema = z.object({
+  sessionId: z.string().min(1),
+  update: z.record(z.string(), z.unknown()),
+});
+const frameSchema = z.object({
+  jsonrpc: z.literal("2.0"),
+  id: z.union([z.string(), z.number()]).nullable().optional(),
+  method: z.string().optional(),
+  params: z.unknown().optional(),
+  result: z.unknown().optional(),
+  error: z
+    .object({
+      code: z.number(),
+      message: z.string(),
+      data: z.unknown().optional(),
+    })
+    .optional(),
+});
+export type AcpPermissionRequestParams = z.infer<
+  typeof permissionRequestSchema
+>;
+export type AcpPermissionOption = AcpPermissionRequestParams["options"][number];
+export type AcpSessionUpdateParams = z.infer<typeof sessionUpdateSchema>;
 export interface AcpPermissionOutcome {
-  outcome:
-    | { outcome: "selected"; optionId: string }
-    | { outcome: "cancelled" };
+  outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" };
 }
-
-export interface AcpSessionUpdateParams {
-  sessionId: string;
-  update: Record<string, unknown>;
-}
-
 interface PendingRpc {
-  method: string;
   resolve(result: unknown): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout> | null;
 }
-
 export interface AcpClientOptions {
   launch: ProviderLaunch;
   cwd?: string;
   env?: Record<string, string>;
   startupTimeoutMs?: number;
   onSessionUpdate?(params: AcpSessionUpdateParams): void | Promise<void>;
-  onPermissionRequest?(params: AcpPermissionRequestParams): Promise<AcpPermissionOutcome>;
+  onPermissionRequest?(
+    params: AcpPermissionRequestParams,
+  ): Promise<AcpPermissionOutcome>;
   onExit?(error: AntigravityError): void;
 }
 
@@ -75,6 +89,7 @@ export class AcpClient {
   private failure: AntigravityError | null = null;
   private closing = false;
   private closePromise: Promise<void> | null = null;
+  private updateTail: Promise<void> = Promise.resolve();
   private readonly exited: Promise<void>;
   public agentCapabilities: Record<string, unknown> = {};
   public agentVersion = "";
@@ -85,68 +100,82 @@ export class AcpClient {
       env: { ...launch.env, ...env },
       cwd,
       stdio: "pipe",
+      detached: process.platform !== "win32",
     });
-
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", (chunk: string) => {
       this.stderr = (this.stderr + chunk).slice(-8192);
     });
-
     const lines = createInterface({ input: this.child.stdout });
     lines.on("line", (line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
+      if (!line.trim()) return;
+      let value: unknown;
       try {
-        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-        this.handleFrame(parsed);
+        value = JSON.parse(line);
       } catch {
-        // Ignore non-JSON diagnostic lines on stdout if any
+        // Some CLI versions put diagnostic text on stdout.
+        return;
+      }
+      if (this.closing || this.failure) return;
+      try {
+        this.handleFrame(frameSchema.parse(value));
+      } catch (error) {
+        this.fail(new AntigravityError(String(error), "INVALID_FRAME"));
       }
     });
-
-    this.child.stdin.on("error", () => {
-      // Handled by process close
+    this.child.stdin.on("error", (error) => {
+      if (!this.closing)
+        this.fail(new AntigravityError(error.message, "TRANSPORT_ERROR"));
     });
-
-    this.child.on("error", (err) => {
-      this.fail(new AntigravityError(`Failed to spawn agy acp: ${err.message}`, "SPAWN_FAILED"));
+    this.child.on("error", (error) => {
+      this.fail(
+        new AntigravityError(
+          "Failed to spawn agy acp: " + error.message,
+          "SPAWN_FAILED",
+        ),
+      );
     });
-
     this.exited = new Promise<void>((resolve) => {
       this.child.once("close", (code, signal) => {
         lines.close();
         const detail = this.stderr.trim();
-        const msg = detail
-          ? formatDiagnostic(detail)
-          : `Antigravity ACP exited (${signal ?? code ?? "unknown"})`;
-        this.fail(new AntigravityError(msg, "PROCESS_EXITED", detail || undefined));
+        const message =
+          detail ||
+          "Antigravity ACP exited (" + (signal ?? code ?? "unknown") + ")";
+        const error = new AntigravityError(
+          formatDiagnostic(message),
+          "PROCESS_EXITED",
+          detail || undefined,
+        );
+        // Apply already-received text before publishing the terminal event.
+        void this.updateTail.then(() => this.fail(error));
         resolve();
       });
     });
   }
 
   async initialize(): Promise<void> {
-    const res = await this.request<Record<string, unknown>>(
+    const response = await this.request(
       "initialize",
       {
         protocolVersion: 1,
         clientInfo: { name: "paseo", version: "0.14.0" },
-        capabilities: {
+        clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
-          elicitation: { form: {} },
+          terminal: false,
         },
       },
       this.options.startupTimeoutMs ?? 15000,
     );
-    if (typeof res.agentCapabilities === "object" && res.agentCapabilities !== null) {
-      this.agentCapabilities = res.agentCapabilities as Record<string, unknown>;
-    }
-    if (typeof res.agentInfo === "object" && res.agentInfo !== null) {
-      const info = res.agentInfo as Record<string, unknown>;
-      if (typeof info.version === "string") {
-        this.agentVersion = info.version;
-      }
-    }
+    const parsed = z
+      .object({
+        protocolVersion: z.literal(1),
+        agentCapabilities: z.record(z.string(), z.unknown()).default({}),
+        agentInfo: z.object({ version: z.string().optional() }).optional(),
+      })
+      .parse(response);
+    this.agentCapabilities = parsed.agentCapabilities;
+    this.agentVersion = parsed.agentInfo?.version ?? "";
   }
 
   async request<T = Record<string, unknown>>(
@@ -154,172 +183,221 @@ export class AcpClient {
     params: Record<string, unknown>,
     timeoutMs: number | null = 30000,
   ): Promise<T> {
-    if (this.failure) throw this.failure;
-    if (this.closing) throw new AntigravityError("Antigravity ACP connection is closing", "CLOSED");
-
+    this.assertOpen();
     const id = ++this.sequence;
     const result = await new Promise<unknown>((resolve, reject) => {
       const timer =
         timeoutMs !== null && timeoutMs > 0
           ? setTimeout(() => {
               this.pending.delete(id);
-              reject(new AntigravityError(`Antigravity ACP ${method} timed out`, "TIMEOUT"));
+              reject(
+                new AntigravityError(
+                  "Antigravity ACP " + method + " timed out",
+                  "TIMEOUT",
+                ),
+              );
             }, timeoutMs)
           : null;
-      this.pending.set(id, { method, resolve, reject, timer });
-      this.write({ jsonrpc: "2.0", id, method, params });
+      this.pending.set(id, { resolve, reject, timer });
+      void this.write({ jsonrpc: "2.0", id, method, params }).catch(
+        (error: unknown) => {
+          this.fail(new AntigravityError(String(error), "TRANSPORT_ERROR"));
+        },
+      );
     });
-
     return result as T;
+  }
+
+  async notify(method: string, params: Record<string, unknown>): Promise<void> {
+    this.assertOpen();
+    await this.write({ jsonrpc: "2.0", method, params });
+  }
+
+  async drainUpdates(): Promise<void> {
+    await this.updateTail;
+    if (this.failure) throw this.failure;
   }
 
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
-    for (const pending of this.pending.values()) {
-      if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(new AntigravityError("Antigravity ACP closed", "CLOSED"));
-    }
-    this.pending.clear();
+    this.rejectPending(
+      new AntigravityError("Antigravity ACP closed", "CLOSED"),
+    );
     this.closePromise = this.finishClose();
     return this.closePromise;
   }
 
   private async finishClose(): Promise<void> {
+    this.child.stdin.end();
+    if (await this.exitsWithin(6000)) {
+      await this.terminate("SIGKILL");
+      return;
+    }
+    await this.terminate("SIGTERM");
+    if (await this.exitsWithin(1200)) {
+      await this.terminate("SIGKILL");
+      return;
+    }
+    await this.terminate("SIGKILL");
+    if (!(await this.exitsWithin(1000))) {
+      throw new AntigravityError(
+        "Antigravity ACP did not close its streams",
+        "CLOSE_TIMEOUT",
+      );
+    }
+  }
+
+  private async terminate(signal: "SIGTERM" | "SIGKILL"): Promise<void> {
+    if (process.platform === "win32") {
+      await terminateProcess(this.child, signal);
+      return;
+    }
+    if (this.child.pid === undefined) return;
     try {
-      this.child.stdin.end();
-    } catch {
-      // Ignore stdin close error
+      process.kill(-this.child.pid, signal);
+    } catch (error) {
+      if (
+        !error ||
+        typeof error !== "object" ||
+        !("code" in error) ||
+        error.code !== "ESRCH"
+      )
+        throw error;
     }
-    const drained = await Promise.race([
-      this.exited.then(() => true),
-      delay(800, undefined, { ref: false }).then(() => false),
-    ]);
-    if (drained) return;
-
-    await terminateProcess(this.child, "SIGTERM").catch(() => undefined);
-    const terminated = await Promise.race([
-      this.exited.then(() => true),
-      delay(1200, undefined, { ref: false }).then(() => false),
-    ]);
-    if (terminated) return;
-
-    await terminateProcess(this.child).catch(() => undefined);
-    await Promise.race([
-      this.exited,
-      delay(1000, undefined, { ref: false }),
-    ]);
   }
 
-  private write(frame: Record<string, unknown>): void {
-    if (this.closing) return;
+  private async exitsWithin(ms: number): Promise<boolean> {
+    const controller = new AbortController();
     try {
-      this.child.stdin.write(`${JSON.stringify(frame)}\n`);
-    } catch {
-      // Process exit handles broken pipe
+      return await Promise.race([
+        this.exited.then(() => true),
+        delay(ms, false, { signal: controller.signal }),
+      ]);
+    } finally {
+      controller.abort();
     }
   }
 
-  private handleFrame(frame: Record<string, unknown>): void {
-    const method = typeof frame.method === "string" ? frame.method : undefined;
-    const hasId = frame.id !== undefined && frame.id !== null;
-
-    if (method && hasId) {
-      const requestId = frame.id as string | number;
-      const params = (frame.params ?? {}) as Record<string, unknown>;
-      void this.handleServerRequest(requestId, method, params);
-      return;
-    }
-
-    if (method && !hasId) {
-      const params = (frame.params ?? {}) as Record<string, unknown>;
-      if (method === "session/update" && this.options.onSessionUpdate) {
-        const sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
-        const update =
-          typeof params.update === "object" && params.update !== null
-            ? (params.update as Record<string, unknown>)
-            : {};
-        void Promise.resolve(this.options.onSessionUpdate({ sessionId, update })).catch(() => {
-          // Swallow notification handler errors
-        });
-      }
-      return;
-    }
-
-    if (hasId) {
-      const id = frame.id as string | number;
-      const pending = this.pending.get(id);
-      if (!pending) return;
-      if (pending.timer) clearTimeout(pending.timer);
-      this.pending.delete(id);
-
-      if (frame.error && typeof frame.error === "object") {
-        const errObj = frame.error as Record<string, unknown>;
-        const message =
-          typeof errObj.message === "string" ? errObj.message : "Antigravity ACP request failed";
-        pending.reject(
-          new AntigravityError(formatDiagnostic(message), `RPC_${String(errObj.code ?? "ERROR")}`),
-        );
-      } else {
-        pending.resolve(frame.result);
-      }
-    }
+  private assertOpen(): void {
+    if (this.failure) throw this.failure;
+    if (this.closing)
+      throw new AntigravityError(
+        "Antigravity ACP connection is closing",
+        "CLOSED",
+      );
   }
 
-  private async handleServerRequest(
-    requestId: string | number,
-    method: string,
-    params: Record<string, unknown>,
-  ): Promise<void> {
-    if (method === "session/request_permission" && this.options.onPermissionRequest) {
-      try {
-        const sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
-        const toolCall =
-          typeof params.toolCall === "object" && params.toolCall !== null
-            ? (params.toolCall as Record<string, unknown>)
-            : {};
-        const rawOptions = Array.isArray(params.options) ? params.options : [];
-        const options: AcpPermissionOption[] = rawOptions.map((opt) => {
-          const rec = typeof opt === "object" && opt !== null ? (opt as Record<string, unknown>) : {};
-          return {
-            optionId: typeof rec.optionId === "string" ? rec.optionId : "",
-            name: typeof rec.name === "string" ? rec.name : "Allow",
-            kind: typeof rec.kind === "string" ? rec.kind : "allow_once",
-          };
-        });
-        const outcome = await this.options.onPermissionRequest({
-          sessionId,
-          toolCall,
-          options,
-        });
-        this.write({ jsonrpc: "2.0", id: requestId, result: outcome });
-      } catch {
-        this.write({
-          jsonrpc: "2.0",
-          id: requestId,
-          result: { outcome: { outcome: "cancelled" } },
-        });
-      }
-      return;
-    }
-
-    this.write({
-      jsonrpc: "2.0",
-      id: requestId,
-      error: { code: -32601, message: `Unsupported client method: ${method}` },
+  private write(frame: Record<string, unknown>): Promise<void> {
+    if (this.closing)
+      return Promise.reject(
+        new AntigravityError("Antigravity ACP closed", "CLOSED"),
+      );
+    return new Promise((resolve, reject) => {
+      this.child.stdin.write(JSON.stringify(frame) + "\n", (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
     });
   }
 
-  private fail(error: AntigravityError): void {
-    if (this.failure) return;
-    this.failure = error;
+  private handleFrame(frame: z.infer<typeof frameSchema>): void {
+    const id = frame.id;
+    const method = frame.method;
+    if (method && id !== undefined && id !== null) {
+      void this.updateTail
+        .then(() => this.handleServerRequest(id, method, frame.params))
+        .catch((error: unknown) => {
+          if (!this.closing)
+            this.fail(
+              new AntigravityError(String(error), "CLIENT_REQUEST_FAILED"),
+            );
+        });
+      return;
+    }
+    if (method) {
+      if (method !== "session/update" || !this.options.onSessionUpdate) return;
+      const params = sessionUpdateSchema.parse(frame.params);
+      this.updateTail = this.updateTail
+        .then(async () => {
+          if (!this.closing && !this.failure)
+            await this.options.onSessionUpdate?.(params);
+        })
+        .catch((error: unknown) => {
+          this.fail(new AntigravityError(String(error), "UPDATE_FAILED"));
+        });
+      return;
+    }
+    if (id === undefined || id === null) return;
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.timer = null;
+    void this.updateTail.then(() => {
+      if (!this.pending.delete(id)) return;
+      if (this.failure) pending.reject(this.failure);
+      else if (frame.error)
+        pending.reject(
+          new AntigravityError(
+            formatDiagnostic(frame.error.message),
+            "RPC_" + frame.error.code,
+          ),
+        );
+      else pending.resolve(frame.result);
+    });
+  }
+
+  private async handleServerRequest(
+    id: string | number,
+    method: string,
+    params: unknown,
+  ): Promise<void> {
+    if (this.closing || this.failure) return;
+    if (
+      method !== "session/request_permission" ||
+      !this.options.onPermissionRequest
+    ) {
+      await this.write({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32601,
+          message: "Unsupported client method: " + method,
+        },
+      });
+      return;
+    }
+    let result: AcpPermissionOutcome;
+    try {
+      result = await this.options.onPermissionRequest(
+        permissionRequestSchema.parse(params),
+      );
+    } catch {
+      result = { outcome: { outcome: "cancelled" } };
+    }
+    if (!this.closing && !this.failure)
+      await this.write({ jsonrpc: "2.0", id, result });
+  }
+
+  private rejectPending(error: AntigravityError): void {
     for (const pending of this.pending.values()) {
       if (pending.timer) clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pending.clear();
-    if (!this.closing && this.options.onExit) {
-      this.options.onExit(error);
+  }
+
+  private fail(error: AntigravityError): void {
+    if (this.failure) return;
+    this.failure = error;
+    this.rejectPending(error);
+    if (!this.closing) {
+      this.options.onExit?.(error);
+      void this.close().catch((closeError: unknown) => {
+        this.options.onExit?.(
+          new AntigravityError(String(closeError), "CLOSE_FAILED"),
+        );
+      });
     }
   }
 }

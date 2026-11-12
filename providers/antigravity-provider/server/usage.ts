@@ -3,7 +3,10 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { execCommand, type UsageSourceRegistration } from "@getpaseo/plugin/server";
+import {
+  execCommand,
+  type UsageSourceRegistration,
+} from "@getpaseo/plugin/server";
 import type { ProviderLaunch } from "@getpaseo/plugin/server/provider";
 import {
   hashAccountKey,
@@ -22,23 +25,24 @@ const usageInputSchema = z
   })
   .strict();
 
-interface QuotaWindowSnapshot {
-  id: string;
-  label: string;
-  shortLabel: string;
-  usedPct: number;
-  remainingPct: number;
-  resetsAt: string | null;
-  note: string | null;
-}
-
-interface CachedUsageSnapshot {
-  email?: string;
-  tierName?: string;
-  tierId?: string;
-  observedAtMs: number;
-  windows: QuotaWindowSnapshot[];
-}
+const quotaWindowSchema = z.object({
+  id: z.string().min(1),
+  label: z.string(),
+  shortLabel: z.string(),
+  usedPct: z.number().min(0).max(100),
+  remainingPct: z.number().min(0).max(100),
+  resetsAt: z.string().nullable(),
+  note: z.string().nullable(),
+});
+const cachedUsageSchema = z.object({
+  email: z.string().optional(),
+  tierName: z.string().optional(),
+  tierId: z.string().optional(),
+  observedAtMs: z.number().nonnegative(),
+  windows: z.array(quotaWindowSchema),
+});
+type QuotaWindowSnapshot = z.infer<typeof quotaWindowSchema>;
+type CachedUsageSnapshot = z.infer<typeof cachedUsageSchema>;
 
 const PTY_USAGE_PYTHON_SCRIPT = `
 import pty, os, time, select, sys, fcntl, struct, termios, signal
@@ -65,11 +69,11 @@ else:
                 data = os.read(fd, 8192)
                 if not data:
                     break
-                out += data
+                out = (out + data)[-512 * 1024:]
             except OSError:
                 break
         now = time.time()
-        if stage == 0 and (b"for shortcuts" in out or now - start > 3.5):
+        if stage == 0 and b"for shortcuts" in out:
             os.write(fd, b"\\x1b")
             stage = 1
             stage_time = now
@@ -90,6 +94,18 @@ else:
         os.kill(pid, signal.SIGTERM)
     except OSError:
         pass
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        ended, _ = os.waitpid(pid, os.WNOHANG)
+        if ended:
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        os.waitpid(pid, 0)
     try:
         os.close(fd)
     except OSError:
@@ -102,7 +118,12 @@ function resolveHome(env?: Record<string, string | undefined>): string {
 }
 
 function cacheFilePath(home: string): string {
-  return path.join(home, ".gemini", "antigravity-cli", "paseo-usage-cache.json");
+  return path.join(
+    home,
+    ".gemini",
+    "antigravity-cli",
+    "paseo-usage-cache.json",
+  );
 }
 
 function hasAntigravityState(home: string): boolean {
@@ -112,6 +133,7 @@ function hasAntigravityState(home: string): boolean {
   );
 }
 
+/* oxlint-disable no-control-regex -- PTY output contains ANSI terminal control bytes. */
 function stripAnsi(raw: string): string {
   return raw
     .replace(/\x1b\[[0-9;:?]*m/g, "")
@@ -121,6 +143,7 @@ function stripAnsi(raw: string): string {
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
 }
 
+/* oxlint-enable no-control-regex */
 function parseRefreshDurationMs(note: string | null): number | null {
   if (!note) return null;
   const match = /Refreshes\s+in\s+(.+)/i.exec(note);
@@ -195,14 +218,17 @@ export function parsePtyUsageOutput(
       continue;
     }
 
-    const pctMatch = /(?:Remaining:\s*)?(\d+(?:\.\d+)?)%\s*(?:\(([^)]+)\))?/i.exec(line);
+    const pctMatch =
+      /(?:Remaining:\s*)?(\d+(?:\.\d+)?)%\s*(?:\(([^)]+)\))?/i.exec(line);
     if (pctMatch && currentGroup && currentPeriod) {
       const remainingPct = Number(Number(pctMatch[1]).toFixed(2));
       const usedPct = Number(Math.max(0, 100 - remainingPct).toFixed(2));
       const inlineNote = pctMatch[2]?.trim() ?? null;
       const refreshMs = parseRefreshDurationMs(inlineNote);
       const resetsAt =
-        refreshMs !== null ? new Date(observedAtMs + refreshMs).toISOString() : null;
+        refreshMs !== null
+          ? new Date(observedAtMs + refreshMs).toISOString()
+          : null;
 
       const groupLabel = currentGroup === "gemini" ? "Gemini" : "Claude & GPT";
       const groupShort = currentGroup === "gemini" ? "Gemini" : "Claude/GPT";
@@ -225,7 +251,8 @@ export function parsePtyUsageOutput(
     }
 
     if (lastWindowId) {
-      const noteMatch = /^(Refreshes\s+in\s+[0-9dhms\s]+|Quota\s+available)/i.exec(line);
+      const noteMatch =
+        /^(Refreshes\s+in\s+[0-9dhms\s]+|Quota\s+available)/i.exec(line);
       if (noteMatch) {
         const win = byId.get(lastWindowId);
         if (win) {
@@ -261,8 +288,12 @@ export function parsePtyUsageOutput(
 
 export class AntigravityUsage {
   private readonly launches = new Map<string, ProviderLaunch>();
+  private closed = false;
   private readonly memoryCache = new Map<string, CachedUsageSnapshot>();
-  private readonly inflightProbes = new Map<string, Promise<CachedUsageSnapshot>>();
+  private readonly inflightProbes = new Map<
+    string,
+    Promise<CachedUsageSnapshot>
+  >();
 
   remember(launch: ProviderLaunch): { home: string } {
     const home = resolveHome(launch.env);
@@ -275,7 +306,7 @@ export class AntigravityUsage {
     tierName?: string,
     tierId?: string,
   ): void {
-    if (!tierName) return;
+    if (!tierName || this.closed) return;
     const home = resolveHome(env);
     const existing = this.memoryCache.get(home);
     const updated: CachedUsageSnapshot = {
@@ -289,23 +320,31 @@ export class AntigravityUsage {
     void this.saveDiskCache(home, updated);
   }
 
-  close(): void {
+  async close(): Promise<void> {
+    this.closed = true;
+    await Promise.allSettled(this.inflightProbes.values());
     this.launches.clear();
+    this.memoryCache.clear();
   }
 
-  private async loadDiskCache(home: string): Promise<CachedUsageSnapshot | null> {
+  private async loadDiskCache(
+    home: string,
+  ): Promise<CachedUsageSnapshot | null> {
     const mem = this.memoryCache.get(home);
     if (mem && mem.windows.length > 0) return mem;
     const file = cacheFilePath(home);
     if (!existsSync(file)) return mem ?? null;
     try {
-      const raw = JSON.parse(await readFile(file, "utf8")) as CachedUsageSnapshot;
+      const raw = cachedUsageSchema.parse(
+        JSON.parse(await readFile(file, "utf8")),
+      );
       if (raw && typeof raw === "object" && Array.isArray(raw.windows)) {
         const merged: CachedUsageSnapshot = {
           email: raw.email ?? mem?.email,
           tierName: mem?.tierName ?? raw.tierName,
           tierId: mem?.tierId ?? raw.tierId,
-          observedAtMs: typeof raw.observedAtMs === "number" ? raw.observedAtMs : 0,
+          observedAtMs:
+            typeof raw.observedAtMs === "number" ? raw.observedAtMs : 0,
           windows: raw.windows,
         };
         this.memoryCache.set(home, merged);
@@ -317,7 +356,10 @@ export class AntigravityUsage {
     return mem ?? null;
   }
 
-  private async saveDiskCache(home: string, snapshot: CachedUsageSnapshot): Promise<void> {
+  private async saveDiskCache(
+    home: string,
+    snapshot: CachedUsageSnapshot,
+  ): Promise<void> {
     const file = cacheFilePath(home);
     try {
       await mkdir(path.dirname(file), { recursive: true });
@@ -360,16 +402,21 @@ export class AntigravityUsage {
         { cwd: os.tmpdir(), mcpServers: [] },
         8000,
       );
-      const sessionId = typeof res.sessionId === "string" ? res.sessionId : undefined;
+      const sessionId =
+        typeof res.sessionId === "string" ? res.sessionId : undefined;
       if (sessionId) {
-        await client.request("session/close", { sessionId }, 2000).catch(() => undefined);
+        await client
+          .request("session/close", { sessionId }, 2000)
+          .catch(() => undefined);
       }
       const meta =
         typeof res._meta === "object" && res._meta !== null
           ? (res._meta as Record<string, unknown>)
           : undefined;
       const agyMeta =
-        meta && typeof meta.antigravity === "object" && meta.antigravity !== null
+        meta &&
+        typeof meta.antigravity === "object" &&
+        meta.antigravity !== null
           ? (meta.antigravity as Record<string, unknown>)
           : undefined;
       const tier =
@@ -388,16 +435,22 @@ export class AntigravityUsage {
   }
 
   private async probeLiveUsage(home: string): Promise<CachedUsageSnapshot> {
+    if (this.closed) throw new Error("Antigravity usage source is closed");
     const inflight = this.inflightProbes.get(home);
     if (inflight) return inflight;
 
     const promise = (async (): Promise<CachedUsageSnapshot> => {
       const prior = await this.loadDiskCache(home);
       const now = Date.now();
-      if (prior && prior.windows.length > 0 && now - prior.observedAtMs < 15_000) {
+      if (
+        prior &&
+        prior.windows.length > 0 &&
+        now - prior.observedAtMs < 15_000
+      ) {
         return prior;
       }
 
+      if (this.closed) throw new Error("Antigravity usage source is closed");
       const launch = this.resolveLaunchForHome(home);
       const ptyResult = await execCommand(
         "python3",
@@ -414,19 +467,27 @@ export class AntigravityUsage {
 
       const observedAtMs = Date.now();
       const parsed = parsePtyUsageOutput(ptyResult.stdout, observedAtMs);
+      if (parsed.windows.length === 0)
+        throw new Error(
+          "Could not refresh Antigravity quota; cached quota is not current. Ensure agy and python3 are available and signed in.",
+        );
       const tierResult =
         parsed.tierName || prior?.tierName
-          ? { tierName: parsed.tierName ?? prior?.tierName, tierId: prior?.tierId }
+          ? {
+              tierName: parsed.tierName ?? prior?.tierName,
+              tierId: prior?.tierId,
+            }
           : await this.probeTierViaAcp(launch);
 
-      const snapshot: CachedUsageSnapshot = {
+      const snapshot: CachedUsageSnapshot = cachedUsageSchema.parse({
         email: parsed.email ?? prior?.email,
         tierName: tierResult.tierName ?? prior?.tierName,
         tierId: tierResult.tierId ?? prior?.tierId,
-        observedAtMs: parsed.windows.length > 0 ? observedAtMs : (prior?.observedAtMs ?? 0),
-        windows: parsed.windows.length > 0 ? parsed.windows : (prior?.windows ?? []),
-      };
+        observedAtMs,
+        windows: parsed.windows,
+      });
 
+      if (this.closed) return snapshot;
       this.memoryCache.set(home, snapshot);
       if (snapshot.windows.length > 0 || snapshot.email || snapshot.tierName) {
         await this.saveDiskCache(home, snapshot);
@@ -457,7 +518,10 @@ export class AntigravityUsage {
         } else {
           if (scope.provider !== "antigravity") return [];
           const sessionHome = resolveHome(scope.env);
-          if (this.launches.has(sessionHome) || hasAntigravityState(sessionHome)) {
+          if (
+            this.launches.has(sessionHome) ||
+            hasAntigravityState(sessionHome)
+          ) {
             homes.add(sessionHome);
           }
         }
@@ -485,7 +549,8 @@ export class AntigravityUsage {
           if (snapshot.windows.length === 0) {
             return unavailable({
               kind: "no_quota",
-              detail: "No Antigravity quota reported. Ensure `agy` is signed in.",
+              detail:
+                "No Antigravity quota reported. Ensure `agy` is signed in.",
             });
           }
 
@@ -500,12 +565,26 @@ export class AntigravityUsage {
             tone: toneFromUsedPct(w.usedPct),
           }));
 
-          const details: UsageDetail[] = [];
+          const details: UsageDetail[] = [
+            {
+              id: "observed_at",
+              label: "Updated",
+              value: new Date(snapshot.observedAtMs).toISOString(),
+            },
+          ];
           if (snapshot.email) {
-            details.push({ id: "account", label: "Account", value: snapshot.email });
+            details.push({
+              id: "account",
+              label: "Account",
+              value: snapshot.email,
+            });
           }
           if (snapshot.tierName) {
-            details.push({ id: "tier", label: "Tier", value: snapshot.tierName });
+            details.push({
+              id: "tier",
+              label: "Tier",
+              value: snapshot.tierName,
+            });
           }
           for (const w of snapshot.windows) {
             if (w.note) {

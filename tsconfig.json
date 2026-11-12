@@ -3,12 +3,12 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "target": "ES2022",
-    "lib": ["ES2023", "DOM"],
+    "lib": ["ES2024", "DOM"],
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
     "jsx": "react-jsx"
   },
-  "include": ["providers/**/*.ts", "providers/**/*.tsx"],
+  "include": ["providers/**/*.ts", "providers/**/*.tsx", "tests/**/*.ts"],
   "exclude": ["node_modules", "templates", ".backup-original"]
 }

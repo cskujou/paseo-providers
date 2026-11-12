@@ -9,6 +9,22 @@
     "install:restart": "bash ./install.sh --all --restart",
     "list": "bash ./install.sh --list",
     "new": "bash ./install.sh --new",
-    "uninstall": "bash ./install.sh --uninstall"
+    "uninstall": "bash ./install.sh --uninstall",
+    "test": "vitest run --maxWorkers=1",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint providers tests",
+    "format": "prettier --write providers tests",
+    "format:check": "prettier --check providers tests"
+  },
+  "engines": { "node": ">=24.9.0" },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.14.0",
+    "@getpaseo/protocol": "0.14.0",
+    "@types/node": "^24.0.0",
+    "oxlint": "^1.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0",
+    "zod": "^4.4.3"
   }
 }
