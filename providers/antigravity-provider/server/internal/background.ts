@@ -7,6 +7,7 @@ import { resolveTranscriptDir } from "./rewind.js";
 export interface BackgroundTask {
   id: string;
   command: string;
+  daemon: boolean;
   output: string;
   completed: boolean;
   exitCode?: number;
@@ -45,6 +46,7 @@ export async function readBackgroundTurn(
   if (!file) return null;
   let tasks = new Map<string, BackgroundTask>();
   let command = "";
+  let daemon = false;
   let continuationStep: number | undefined;
   let final = false;
   const stream = createReadStream(file, { encoding: "utf8" });
@@ -63,6 +65,8 @@ export async function readBackgroundTurn(
         tasks = new Map();
         continuationStep = undefined;
         final = false;
+        command = "";
+        daemon = false;
       }
       if (record.type === "PLANNER_RESPONSE") {
         final =
@@ -75,8 +79,10 @@ export async function readBackgroundTurn(
             if (
               call?.name === "run_command" &&
               typeof call.args?.CommandLine === "string"
-            )
+            ) {
               command = call.args.CommandLine;
+              daemon = call.args.IsDaemon === true;
+            }
           }
       } else if (
         record.type !== "CHECKPOINT" &&
@@ -93,6 +99,7 @@ export async function readBackgroundTurn(
           tasks.set(match[1]!, {
             id: match[1]!,
             command: /Task Description:\s*([^\n]+)/.exec(text)?.[1] ?? command,
+            daemon,
             output: text,
             completed: false,
           });
@@ -121,8 +128,9 @@ export async function readBackgroundTurn(
     tasks: [...tasks.values()],
     continuationStep,
     settled:
-      continuationStep !== undefined &&
       final &&
-      [...tasks.values()].every((task) => task.completed),
+      [...tasks.values()].every((task) => task.daemon || task.completed) &&
+      (continuationStep !== undefined ||
+        [...tasks.values()].every((task) => task.daemon)),
   };
 }

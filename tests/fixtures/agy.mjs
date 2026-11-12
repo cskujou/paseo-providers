@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline";
-import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
 if (process.argv.includes("models")) {
@@ -8,6 +8,11 @@ if (process.argv.includes("models")) {
   );
   process.exit(0);
 }
+appendFileSync(
+  path.join(process.env.HOME, "fixture-processes.txt"),
+  process.pid + "\n",
+);
+let controlledTool = false;
 let model = process.env.FIXTURE_MODEL ?? "gemini-4-carbon";
 let thought = "medium";
 let mode = "default";
@@ -143,6 +148,18 @@ input.on("line", (line) => {
         error(f, "unknown config id");
         break;
       }
+      if (
+        controlledTool &&
+        existsSync(path.join(process.env.HOME, "finish-tool"))
+      ) {
+        controlledTool = false;
+        send(
+          update("tool_call_update", {
+            toolCallId: "controlled-tool",
+            status: "completed",
+          }),
+        );
+      }
       reply(f, { configOptions: options() });
       break;
     case "session/prompt": {
@@ -180,6 +197,19 @@ input.on("line", (line) => {
           }, 40);
         break;
       }
+      if (text === "controlled-tool") {
+        controlledTool = true;
+        send(
+          update("tool_call", {
+            toolCallId: "controlled-tool",
+            title: "long tool",
+            kind: "other",
+            status: "in_progress",
+          }),
+        );
+        reply(f, { stopReason: "end_turn" });
+        break;
+      }
       if (text === "late-after-end") {
         send(chunk("agent_message_chunk", "first answer", "reused-message"));
         reply(f, { stopReason: "end_turn" });
@@ -210,7 +240,11 @@ input.on("line", (line) => {
         reply(f, { stopReason: "end_turn" });
         break;
       }
-      if (text === "background-transcript") {
+      if (
+        text === "background-transcript" ||
+        text === "background-held" ||
+        text === "background-daemon"
+      ) {
         const logs = path.join(
           process.env.HOME,
           ".gemini",
@@ -232,7 +266,13 @@ input.on("line", (line) => {
             type: "PLANNER_RESPONSE",
             step_index: 1,
             tool_calls: [
-              { name: "run_command", args: { CommandLine: "sleep 18" } },
+              {
+                name: "run_command",
+                args: {
+                  CommandLine: "sleep 18",
+                  IsDaemon: text === "background-daemon",
+                },
+              },
             ],
           },
           {
@@ -264,30 +304,31 @@ input.on("line", (line) => {
         );
         send(chunk("agent_message_chunk", "waiting"));
         reply(f, { stopReason: "end_turn" });
-        setTimeout(
-          () =>
-            appendFileSync(
-              file,
-              [
-                {
-                  type: "SYSTEM_MESSAGE",
-                  step_index: 4,
-                  status: "DONE",
-                  content:
-                    'Task id "fixture/task-2" finished with result:\nCommand exited with code 0.',
-                },
-                {
-                  type: "PLANNER_RESPONSE",
-                  step_index: 5,
-                  status: "DONE",
-                  content: "AUTO_WAKE_DONE",
-                },
-              ]
-                .map((r) => JSON.stringify(r))
-                .join("\n") + "\n",
-            ),
-          50,
-        );
+        if (text === "background-transcript")
+          setTimeout(
+            () =>
+              appendFileSync(
+                file,
+                [
+                  {
+                    type: "SYSTEM_MESSAGE",
+                    step_index: 4,
+                    status: "DONE",
+                    content:
+                      'Task id "fixture/task-2" finished with result:\nCommand exited with code 0.',
+                  },
+                  {
+                    type: "PLANNER_RESPONSE",
+                    step_index: 5,
+                    status: "DONE",
+                    content: "AUTO_WAKE_DONE",
+                  },
+                ]
+                  .map((r) => JSON.stringify(r))
+                  .join("\n") + "\n",
+              ),
+            50,
+          );
         break;
       }
       if (text === "hold") {

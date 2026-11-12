@@ -387,54 +387,49 @@ describe("Antigravity provider public contract", () => {
     ).toEqual(["started", "failed", "started", "completed"]);
   });
 
-  it("fails a bounded tool drain instead of reporting unfinished work as completed", async () => {
+  it("does not time out or kill a tool just because its drain exceeds 30 seconds", async () => {
     const h = await harness();
     await h.open();
-    const controller = new AbortController();
-    const timeout = vi
-      .spyOn(AbortSignal, "timeout")
-      .mockReturnValue(controller.signal);
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    await h.prompt("first", "controlled-tool");
+    await h.wait(
+      "timeline.item",
+      (e) => e.item.type === "tool_call" && e.item.status === "running",
+    );
+    await h.connection.send({
+      type: "session.can_stop_runtime",
+      sessionId: "s",
+      requestId: "before-long-wait",
+    });
+    await h.wait(
+      "session.can_stop_runtime",
+      (e) => e.requestId === "before-long-wait",
+    );
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
-      await h.prompt("first", "early-end-hold");
-      await h.wait(
-        "timeline.item",
-        (event) =>
-          event.item.type === "tool_call" && event.item.status === "running",
-      );
-      // A control round-trip proves the early response was read and its drain started.
-      await h.connection.send({
-        type: "session.can_stop_runtime",
-        sessionId: "s",
-        requestId: "draining",
-      });
-      await h.wait(
-        "session.can_stop_runtime",
-        (event) => event.requestId === "draining",
-      );
-      controller.abort();
-      const failed = await h.wait(
-        "session.turn",
-        (event) => event.state === "failed",
-      );
-      expect(failed.error?.message).toContain("before its tools settled");
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
       expect(
-        h.events
-          .filter((event) => event.type === "session.turn")
-          .map((event) => event.state),
-      ).toEqual(["started", "failed"]);
-      expect(
-        h.events
-          .filter((event) => event.type === "timeline.item")
-          .filter((event) => event.item.type === "tool_call")
-          .map((event) =>
-            event.item.type === "tool_call" ? event.item.status : "",
-          ),
-      ).toEqual(["running", "failed"]);
+        h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+      ).toEqual(["started"]);
+      expect(timeout).not.toHaveBeenCalled();
     } finally {
+      vi.useRealTimers();
       timeout.mockRestore();
     }
-    await h.prompt("second", "next");
-    await h.wait("session.turn", (event) => event.state === "completed");
+    await writeFile(path.join(h.cwd, "finish-tool"), "done");
+    await h.connection.send({
+      type: "session.configure",
+      sessionId: "s",
+      requestId: "release-tool",
+      changes: { thinkingOption: "high" },
+    });
+    await h.wait("request.completed", (e) => e.requestId === "release-tool");
+    await h.wait("session.turn", (e) => e.state === "completed");
+    expect(
+      (await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8"))
+        .trim()
+        .split("\n"),
+    ).toHaveLength(1);
   });
 
   it("cancels a tool drain even when the prompt response already returned", async () => {
@@ -468,7 +463,7 @@ describe("Antigravity provider public contract", () => {
     await h.wait("session.turn", (event) => event.state === "completed");
   });
 
-  it("retires the previous ACP stream and isolates reused message IDs before admitting the next turn", async () => {
+  it("keeps the ACP process between normal turns and isolates reused message IDs", async () => {
     const h = await harness();
     await h.open();
     await h.prompt("first", "late-after-end");
@@ -512,6 +507,11 @@ describe("Antigravity provider public contract", () => {
           event.item.type === "tool_call" ? event.item.status : "",
         ),
     ).toEqual(["completed"]);
+    expect(
+      (await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8"))
+        .trim()
+        .split("\n"),
+    ).toHaveLength(1);
   });
 
   it("keeps the turn alive until a background task's transcript-only automatic reply finishes", async () => {
@@ -578,6 +578,136 @@ describe("Antigravity provider public contract", () => {
     expect(
       h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
     ).toEqual(["started", "canceled"]);
+  });
+
+  it("keeps long background work alive beyond the old ten-minute deadline", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("background", "background-held");
+    await h.wait(
+      "timeline.item",
+      (e) => e.item.type === "assistant_message" && e.item.text === "waiting",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // Advancing wall time must not turn an active task into a failure.
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(Date.now() + 60 * 60 * 1000);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 550));
+      await h.connection.send({
+        type: "session.can_stop_runtime",
+        sessionId: "s",
+        requestId: "still-background-busy",
+      });
+      expect(
+        (
+          await h.wait(
+            "session.can_stop_runtime",
+            (e) => e.requestId === "still-background-busy",
+          )
+        ).canStop,
+      ).toBe(false);
+      expect(
+        h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+      ).toEqual(["started"]);
+      const file = path.join(
+        h.cwd,
+        ".gemini",
+        "antigravity-cli",
+        "brain",
+        "fixture",
+        ".system_generated",
+        "logs",
+        "transcript_full.jsonl",
+      );
+      const existing = await readFile(file, "utf8");
+      await rm(file);
+      await new Promise((resolve) => setTimeout(resolve, 550));
+      expect(
+        h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+      ).toEqual(["started"]);
+      await writeFile(
+        file,
+        existing +
+          [
+            {
+              type: "SYSTEM_MESSAGE",
+              step_index: 4,
+              status: "DONE",
+              content:
+                'Task id "fixture/task-2" finished with result:\nCommand exited with code 0.',
+            },
+            {
+              type: "PLANNER_RESPONSE",
+              step_index: 5,
+              status: "DONE",
+              content: "LONG_TASK_DONE",
+            },
+          ]
+            .map((record) => JSON.stringify(record))
+            .join("\n") +
+          "\n",
+      );
+      await h.wait("session.turn", (e) => e.state === "completed");
+      expect(
+        h.events.filter((e) => e.type === "timeline.item").at(-1)?.item,
+      ).toMatchObject({ type: "assistant_message", text: "LONG_TASK_DONE" });
+      expect(
+        (await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8"))
+          .trim()
+          .split("\n"),
+      ).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("does not wait for an intentional daemon to exit or reclaim its process at idle", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("daemon", "background-daemon");
+    await h.wait("session.turn", (e) => e.state === "completed");
+    await h.connection.send({
+      type: "session.can_stop_runtime",
+      sessionId: "s",
+      requestId: "daemon-idle",
+    });
+    expect(
+      (
+        await h.wait(
+          "session.can_stop_runtime",
+          (e) => e.requestId === "daemon-idle",
+        )
+      ).canStop,
+    ).toBe(false);
+    await h.prompt("next", "next");
+    await h.wait("session.prompt_result", (e) => e.clientMessageId === "next");
+    await h.wait(
+      "session.turn",
+      (e) =>
+        e.state === "completed" &&
+        e.turnId !== h.events.find((e) => e.type === "session.turn")?.turnId,
+    );
+    expect(
+      (await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8"))
+        .trim()
+        .split("\n"),
+    ).toHaveLength(1);
+  });
+
+  it("does not kill a healthy process when the model reaches a token limit", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("limited", "max_tokens");
+    await h.wait("session.turn", (e) => e.state === "failed");
+    await h.prompt("next", "next");
+    await h.wait("session.turn", (e) => e.state === "completed");
+    expect(
+      (await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8"))
+        .trim()
+        .split("\n"),
+    ).toHaveLength(1);
   });
 
   it("does not advertise steering without a native acknowledgement", async () => {

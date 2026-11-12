@@ -137,6 +137,7 @@ export class Session {
   private readonly rewindTracker: SessionRewindTracker;
   private activeTurn: ActiveTurn | null = null;
   private readonly toolCalls = new Map<string, AcpToolCallState>();
+  private readonly retiredToolCalls = new Set<string>();
   private readonly messages = new Map<string, string>();
   private readonly fallbackChunkIds = new Map<string, string>();
   private chunkSequence = 0;
@@ -155,6 +156,7 @@ export class Session {
   private sessionCatalog: ProviderCatalog;
   private configOptions: AcpConfigOption[] = [];
   private configuring = false;
+  private hasDaemonTasks = false;
 
   constructor(private readonly options: SessionOptions) {
     const saved = parsePersistenceConversationId(options.persistence);
@@ -255,6 +257,7 @@ export class Session {
       this.starting === null &&
       !this.configuring &&
       !this.hasRunningTools() &&
+      !this.hasDaemonTasks &&
       this.pendingPermissions.size === 0
     );
   }
@@ -313,6 +316,7 @@ export class Session {
       };
       this.activeTurn = turn;
       this.messages.clear();
+      for (const id of this.toolCalls.keys()) this.retiredToolCalls.add(id);
       this.toolCalls.clear();
       this.fallbackChunkIds.clear();
       this.pendingPrompt = null;
@@ -362,18 +366,15 @@ export class Session {
             "TURN_LIMIT",
           );
         if (!canceled) {
-          const background = await this.waitForBackgroundTurn(turn);
-          if (!background) await this.waitForTurnTools(turn);
+          await this.waitForBackgroundTurn(turn);
+          await this.waitForTurnTools(turn);
         }
         if (this.activeTurn !== turn) return;
-        await this.retireTurnClient(client);
-        if (this.activeTurn !== turn) return;
-        if (turn.canceled || canceled) this.finishRunningTools("canceled");
-        else if (this.hasRunningTools())
-          throw new AntigravityError(
-            "Antigravity started an unfinished tool after end_turn",
-            "INVALID_TURN_BOUNDARY",
-          );
+        if (turn.canceled || canceled) {
+          await this.stopCanceledClient(client);
+          if (this.activeTurn !== turn) return;
+          this.finishRunningTools("canceled");
+        }
         this.emit({
           type: "session.turn",
           sessionId: this.options.id,
@@ -382,19 +383,8 @@ export class Session {
         });
       } catch (error) {
         if (this.activeTurn !== turn) return;
-        let failure = error;
-        try {
-          await this.retireTurnClient(client);
-        } catch (closeError) {
-          failure = new AggregateError(
-            [error, closeError],
-            "Antigravity turn and runtime teardown failed",
-          );
-        }
-        if (this.activeTurn !== turn) return;
         this.finishRunningTools(turn.canceled ? "canceled" : "failed");
-        const message =
-          failure instanceof Error ? failure.message : String(failure);
+        const message = error instanceof Error ? error.message : String(error);
         this.emit({
           type: "session.turn",
           sessionId: this.options.id,
@@ -416,31 +406,27 @@ export class Session {
     }
   }
 
-  private async waitForBackgroundTurn(turn: ActiveTurn): Promise<boolean> {
-    if (!this.conversationId) return false;
+  private async waitForBackgroundTurn(turn: ActiveTurn): Promise<void> {
+    if (!this.conversationId) return;
     let snapshot = await readBackgroundTurn(
       this.conversationId,
       this.mergedEnv,
     );
-    if (!snapshot) return false;
-    const deadline = Date.now() + 10 * 60 * 1000;
+    if (!snapshot) return;
     while (this.activeTurn === turn && !turn.canceled && !snapshot.settled) {
-      if (Date.now() >= deadline)
-        throw new AntigravityError(
-          "Antigravity background task did not finish its automatic continuation",
-          "BACKGROUND_TIMEOUT",
-        );
       await Promise.race([delay(250), turn.activity.promise]);
-      if (this.activeTurn !== turn || turn.canceled) return true;
+      if (this.activeTurn !== turn || turn.canceled) return;
       turn.activity = Promise.withResolvers<void>();
-      snapshot = await readBackgroundTurn(this.conversationId, this.mergedEnv);
-      if (!snapshot)
-        throw new AntigravityError(
-          "Antigravity background transcript became unavailable",
-          "BACKGROUND_STATE_LOST",
-        );
+      const updated = await readBackgroundTurn(
+        this.conversationId,
+        this.mergedEnv,
+      );
+      if (updated) snapshot = updated;
     }
-    if (this.activeTurn !== turn || turn.canceled) return true;
+    if (this.activeTurn !== turn || turn.canceled) return;
+    this.hasDaemonTasks ||= snapshot.tasks.some(
+      (task) => task.daemon && !task.completed,
+    );
     for (const task of snapshot.tasks) {
       for (const [id, state] of this.toolCalls) {
         const input = state.rawInput;
@@ -467,6 +453,7 @@ export class Session {
         this.emitItem(item);
       }
     }
+    if (snapshot.continuationStep === undefined) return;
     // Only publish the autonomous continuation, not the already streamed foreground.
     for (const item of await readTranscriptTimeline(
       this.conversationId,
@@ -476,32 +463,17 @@ export class Session {
       if (step && Number(step[1]) >= snapshot.continuationStep!)
         this.emitItem(item);
     }
-    return true;
+    return;
   }
 
   private async waitForTurnTools(turn: ActiveTurn): Promise<void> {
-    const deadline = AbortSignal.timeout(30000);
     while (
       this.activeTurn === turn &&
       !turn.canceled &&
       this.hasRunningTools()
     ) {
       turn.activity = Promise.withResolvers<void>();
-      await new Promise<void>((resolve, reject) => {
-        const abort = () =>
-          reject(
-            new AntigravityError(
-              "Antigravity returned end_turn before its tools settled",
-              "TURN_DRAIN_TIMEOUT",
-            ),
-          );
-        deadline.addEventListener("abort", abort, { once: true });
-        if (deadline.aborted) abort();
-        void turn.activity.promise.then(() => {
-          deadline.removeEventListener("abort", abort);
-          resolve();
-        });
-      });
+      await turn.activity.promise;
     }
   }
 
@@ -511,11 +483,13 @@ export class Session {
     );
   }
 
-  private async retireTurnClient(client: AcpClient): Promise<void> {
-    // ACP updates identify a session, not a turn. EOF closes the old stream before
-    // publishing completion, so an unlabelled late update cannot belong to the next prompt.
+  private async stopCanceledClient(client: AcpClient): Promise<void> {
+    // Canceling after the ACP prompt response must also stop its background work.
     await client.close();
-    if (this.client === client) this.client = null;
+    if (this.client === client) {
+      this.client = null;
+      this.hasDaemonTasks = false;
+    }
   }
 
   async configure(changes: ProviderConfigChanges): Promise<void> {
@@ -704,6 +678,7 @@ export class Session {
           );
         } finally {
           await client.close();
+          this.hasDaemonTasks = false;
         }
       }
       if (scope !== "conversation") await this.rewindTracker.revertFiles(token);
@@ -1227,6 +1202,21 @@ export class Session {
       const toolCallId =
         typeof update.toolCallId === "string" ? update.toolCallId : "tool";
       const current = this.toolCalls.get(toolCallId);
+      if (kind === "tool_call") this.retiredToolCalls.delete(toolCallId);
+      if (
+        kind === "tool_call_update" &&
+        !current &&
+        this.retiredToolCalls.has(toolCallId)
+      )
+        return;
+      // A delayed update must not reopen an already terminal tool in this turn.
+      if (
+        kind === "tool_call_update" &&
+        current &&
+        (current.status === "completed" || current.status === "failed") &&
+        (update.status === "pending" || update.status === "in_progress")
+      )
+        return;
       const merged = mergeAcpToolCall(update, current);
       if (merged.kind === "execute" || merged.name === "run_command")
         await this.rewindTracker.recordShellOperation();
@@ -1482,6 +1472,7 @@ export class Session {
   private handleUnexpectedExit(error: AntigravityError): void {
     if (this.closed || this.restarting) return;
     this.client = null;
+    this.hasDaemonTasks = false;
     this.cancelPendingPermissions();
     if (this.activeTurn) {
       const turnId = this.activeTurn.id;
