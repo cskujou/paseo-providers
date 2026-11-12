@@ -1,4 +1,6 @@
 import { createInterface } from "node:readline";
+import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import path from "node:path";
 
 if (process.argv.includes("models")) {
   process.stdout.write(
@@ -206,6 +208,86 @@ input.on("line", (line) => {
           }),
         );
         reply(f, { stopReason: "end_turn" });
+        break;
+      }
+      if (text === "background-transcript") {
+        const logs = path.join(
+          process.env.HOME,
+          ".gemini",
+          "antigravity-cli",
+          "brain",
+          "fixture",
+          ".system_generated",
+          "logs",
+        );
+        mkdirSync(logs, { recursive: true });
+        const file = path.join(logs, "transcript_full.jsonl");
+        const records = [
+          {
+            type: "USER_INPUT",
+            step_index: 0,
+            content: "background-transcript",
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 1,
+            tool_calls: [
+              { name: "run_command", args: { CommandLine: "sleep 18" } },
+            ],
+          },
+          {
+            type: "GENERIC",
+            step_index: 2,
+            status: "RUNNING",
+            content:
+              "Tool is running as a background task with task id: fixture/task-2",
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 3,
+            status: "DONE",
+            content: "waiting",
+          },
+        ];
+        writeFileSync(
+          file,
+          records.map((r) => JSON.stringify(r)).join("\n") + "\n",
+        );
+        send(
+          update("tool_call", {
+            toolCallId: "background-call",
+            name: "run_command",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: { CommandLine: "sleep 18" },
+          }),
+        );
+        send(chunk("agent_message_chunk", "waiting"));
+        reply(f, { stopReason: "end_turn" });
+        setTimeout(
+          () =>
+            appendFileSync(
+              file,
+              [
+                {
+                  type: "SYSTEM_MESSAGE",
+                  step_index: 4,
+                  status: "DONE",
+                  content:
+                    'Task id "fixture/task-2" finished with result:\nCommand exited with code 0.',
+                },
+                {
+                  type: "PLANNER_RESPONSE",
+                  step_index: 5,
+                  status: "DONE",
+                  content: "AUTO_WAKE_DONE",
+                },
+              ]
+                .map((r) => JSON.stringify(r))
+                .join("\n") + "\n",
+            ),
+          50,
+        );
         break;
       }
       if (text === "hold") {

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import { readBackgroundTurn } from "./background.js";
 import { z } from "zod";
 import type {
   ProviderCatalog,
@@ -359,7 +361,10 @@ export class Session {
             "Antigravity stopped: " + response.stopReason,
             "TURN_LIMIT",
           );
-        if (!canceled) await this.waitForTurnTools(turn);
+        if (!canceled) {
+          const background = await this.waitForBackgroundTurn(turn);
+          if (!background) await this.waitForTurnTools(turn);
+        }
         if (this.activeTurn !== turn) return;
         await this.retireTurnClient(client);
         if (this.activeTurn !== turn) return;
@@ -409,6 +414,69 @@ export class Session {
     } finally {
       if (this.pendingPrompt === admission) this.pendingPrompt = null;
     }
+  }
+
+  private async waitForBackgroundTurn(turn: ActiveTurn): Promise<boolean> {
+    if (!this.conversationId) return false;
+    let snapshot = await readBackgroundTurn(
+      this.conversationId,
+      this.mergedEnv,
+    );
+    if (!snapshot) return false;
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (this.activeTurn === turn && !turn.canceled && !snapshot.settled) {
+      if (Date.now() >= deadline)
+        throw new AntigravityError(
+          "Antigravity background task did not finish its automatic continuation",
+          "BACKGROUND_TIMEOUT",
+        );
+      await Promise.race([delay(250), turn.activity.promise]);
+      if (this.activeTurn !== turn || turn.canceled) return true;
+      turn.activity = Promise.withResolvers<void>();
+      snapshot = await readBackgroundTurn(this.conversationId, this.mergedEnv);
+      if (!snapshot)
+        throw new AntigravityError(
+          "Antigravity background transcript became unavailable",
+          "BACKGROUND_STATE_LOST",
+        );
+    }
+    if (this.activeTurn !== turn || turn.canceled) return true;
+    for (const task of snapshot.tasks) {
+      for (const [id, state] of this.toolCalls) {
+        const input = state.rawInput;
+        if (
+          state.name !== "run_command" ||
+          !input ||
+          typeof input !== "object" ||
+          Array.isArray(input) ||
+          input.CommandLine !== task.command
+        )
+          continue;
+        const next = {
+          ...state,
+          status:
+            task.exitCode !== undefined && task.exitCode !== 0
+              ? ("failed" as const)
+              : ("completed" as const),
+          rawOutput: task.output,
+        };
+        this.toolCalls.set(id, next);
+        const item = acpToolToTimelineItem(next);
+        if (item.detail.type === "shell")
+          item.detail = { ...item.detail, exitCode: task.exitCode };
+        this.emitItem(item);
+      }
+    }
+    // Only publish the autonomous continuation, not the already streamed foreground.
+    for (const item of await readTranscriptTimeline(
+      this.conversationId,
+      this.mergedEnv,
+    )) {
+      const step = /^history:(\d+):/.exec(item.id);
+      if (step && Number(step[1]) >= snapshot.continuationStep!)
+        this.emitItem(item);
+    }
+    return true;
   }
 
   private async waitForTurnTools(turn: ActiveTurn): Promise<void> {

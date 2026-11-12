@@ -514,6 +514,72 @@ describe("Antigravity provider public contract", () => {
     ).toEqual(["completed"]);
   });
 
+  it("keeps the turn alive until a background task's transcript-only automatic reply finishes", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("background", "background-transcript");
+    await h.wait(
+      "timeline.item",
+      (e) => e.item.type === "assistant_message" && e.item.text === "waiting",
+    );
+    await h.connection.send({
+      type: "session.can_stop_runtime",
+      sessionId: "s",
+      requestId: "background-busy",
+    });
+    expect(
+      (
+        await h.wait(
+          "session.can_stop_runtime",
+          (e) => e.requestId === "background-busy",
+        )
+      ).canStop,
+    ).toBe(false);
+    const completed = await h.wait(
+      "session.turn",
+      (e) => e.state === "completed",
+    );
+    const answers = h.events
+      .filter((e) => e.type === "timeline.item")
+      .filter((e) => e.item.type === "assistant_message");
+    expect(answers.at(-1)?.item).toMatchObject({ text: "AUTO_WAKE_DONE" });
+    expect(h.events.findIndex((e) => e === answers.at(-1))).toBeLessThan(
+      h.events.findIndex((e) => e === completed),
+    );
+    expect(
+      h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+    ).toEqual(["started", "completed"]);
+    const tools = h.events
+      .filter((e) => e.type === "timeline.item")
+      .filter((e) => e.item.type === "tool_call");
+    expect(tools.at(-1)?.item).toMatchObject({
+      status: "completed",
+      detail: { type: "shell", exitCode: 0 },
+    });
+  });
+
+  it("can cancel while waiting for a transcript-only background task", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("background", "background-transcript");
+    await h.wait(
+      "timeline.item",
+      (e) => e.item.type === "assistant_message" && e.item.text === "waiting",
+    );
+    await h.connection.send({
+      type: "session.interrupt",
+      sessionId: "s",
+      requestId: "background-cancel",
+    });
+    await h.wait(
+      "request.completed",
+      (e) => e.requestId === "background-cancel",
+    );
+    expect(
+      h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+    ).toEqual(["started", "canceled"]);
+  });
+
   it("does not advertise steering without a native acknowledgement", async () => {
     const h = await harness();
     expect(h.connection.capabilities.includes("prompt.steer")).toBe(false);
