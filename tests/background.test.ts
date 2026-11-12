@@ -58,6 +58,22 @@ it("waits for task completion and the automatic planner reply, not the foregroun
       continuationStep: 4,
       tasks: [{ command: "sleep 18", completed: true, exitCode: 0 }],
     });
+    records.push({
+      type: "PLANNER_RESPONSE",
+      step_index: 5,
+      status: "ERROR",
+      content: "Agent execution terminated due to error.",
+      error_details: { reason: "upstream failed" },
+    });
+    await save();
+    expect(await readBackgroundTurn("fixture", { HOME: home })).toMatchObject({
+      settled: false,
+      continuationStarted: true,
+      failure: {
+        message: "Agent execution terminated due to error.",
+        details: { reason: "upstream failed" },
+      },
+    });
     records.push({ type: "USER_INPUT" });
     await save();
     expect(await readBackgroundTurn("fixture", { HOME: home })).toBe(null);

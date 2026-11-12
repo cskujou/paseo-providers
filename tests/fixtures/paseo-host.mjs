@@ -8,8 +8,15 @@ import { runInThisContext } from "node:vm";
 
 const require = createRequire(import.meta.url);
 const repo = fileURLToPath(new URL("../../", import.meta.url));
-const serverEntry = require.resolve("@getpaseo/server");
+const serverEntry =
+  process.env.PASEO_TEST_SERVER_ENTRY ?? require.resolve("@getpaseo/server");
 const serverRoot = path.dirname(serverEntry);
+const serverVersion = JSON.parse(
+  await readFile(
+    path.resolve(serverRoot, "..", "..", "..", "package.json"),
+    "utf8",
+  ),
+).version;
 const original = path.join(serverRoot, "agent", "plugin-provider.js");
 const originalRequire = createRequire(original);
 const temporary = await mkdtemp(path.join(os.tmpdir(), "agy-host-test-"));
@@ -38,7 +45,7 @@ try {
   );
   const compiled = await compileDirectoryPlugin(
     path.join(repo, "providers", "antigravity-provider"),
-    "0.14.0",
+    serverVersion,
     "antigravity-provider",
   );
   const exports = runInThisContext(compiled.serverBundle)(originalRequire);
@@ -210,6 +217,128 @@ try {
       }),
     );
     await restored.close();
+  } else if (mode === "background-stream") {
+    const session = await client.createSession(
+      { provider: "antigravity", cwd: temporary, mcpServers: {} },
+      undefined,
+      { persistSession: true },
+    );
+    const waiting = Promise.withResolvers();
+    const live = Promise.withResolvers();
+    const events = [];
+    const unsubscribe = session.subscribe((event) => {
+      events.push(event);
+      if (
+        event.type === "timeline" &&
+        event.item.type === "notification" &&
+        event.item.message.includes("Background task is running")
+      )
+        waiting.resolve();
+      if (
+        event.type === "timeline" &&
+        event.item.type === "tool_call" &&
+        event.item.detail.type === "read" &&
+        event.item.status === "running"
+      )
+        live.resolve();
+    });
+    const run = session.run("background-held");
+    void run.catch(() => {});
+    await waiting.promise;
+    const file = path.join(
+      temporary,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "fixture",
+      ".system_generated",
+      "logs",
+      "transcript_full.jsonl",
+    );
+    const initial = await readFile(file, "utf8");
+    const continuation = [
+      {
+        type: "SYSTEM_MESSAGE",
+        step_index: 4,
+        status: "DONE",
+        content:
+          'Task id "fixture/task-2" finished with result:\nCommand exited with code 0.',
+      },
+      {
+        type: "PLANNER_RESPONSE",
+        step_index: 5,
+        status: "DONE",
+        thinking: "automatic thinking",
+        tool_calls: [{ name: "read_file", args: { Path: "/tmp/result.txt" } }],
+      },
+    ];
+    await writeFile(
+      file,
+      initial + continuation.map((r) => JSON.stringify(r)).join("\n") + "\n",
+    );
+    await live.promise;
+    const endedBeforeTools = events.some(
+      (event) => event.type === "turn_completed",
+    );
+    continuation.push(
+      { type: "GENERIC", step_index: 6, status: "DONE", content: "result" },
+      {
+        type: "PLANNER_RESPONSE",
+        step_index: 7,
+        status: "DONE",
+        content: "STREAM_DONE",
+      },
+    );
+    await writeFile(
+      file,
+      initial + continuation.map((r) => JSON.stringify(r)).join("\n") + "\n",
+    );
+    const result = await run;
+    unsubscribe();
+    console.log(
+      JSON.stringify({
+        endedBeforeTools,
+        finalText: result.finalText,
+        readStatuses: events
+          .filter(
+            (e) =>
+              e.type === "timeline" &&
+              e.item.type === "tool_call" &&
+              e.item.detail.type === "read",
+          )
+          .map((e) => e.item.status),
+        turns: events
+          .filter((e) => e.type.startsWith("turn_"))
+          .map((e) => e.type),
+      }),
+    );
+    await session.close();
+  } else if (mode === "diagnostics") {
+    const session = await client.createSession(
+      { provider: "antigravity", cwd: temporary, mcpServers: {} },
+      undefined,
+      { persistSession: true },
+    );
+    let failure;
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type === "turn_failed") failure = event;
+    });
+    try {
+      await session.run("upstream-error");
+    } catch {
+      /* Inspect the actual host event, not run()'s simplified exception. */
+    }
+    unsubscribe();
+    const result = await session.run("next");
+    console.log(
+      JSON.stringify({
+        message: failure?.error,
+        code: failure?.code,
+        diagnostic: failure?.diagnostic,
+        followUpSucceeded: result.finalText.includes("next"),
+      }),
+    );
+    await session.close();
   } else if (mode === "legacy") {
     // Other plugins still use description; the summary patch must not break them.
     let listener;

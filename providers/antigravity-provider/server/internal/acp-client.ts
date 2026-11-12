@@ -4,23 +4,11 @@ import { spawnProcess, terminateProcess } from "@getpaseo/plugin/server";
 import type { ProviderLaunch } from "@getpaseo/plugin/server/provider";
 import { z } from "zod";
 
-export class AntigravityError extends Error {
-  constructor(
-    message: string,
-    readonly code = "ANTIGRAVITY_ERROR",
-    readonly diagnostic?: string,
-  ) {
-    super(message);
-    this.name = "AntigravityError";
-  }
-}
-
-export function formatDiagnostic(message: string): string {
-  if (/auth|sign.in|log.in|unauthenticated|credential/i.test(message)) {
-    return "Antigravity authentication failed. Run agy and sign in, then retry.";
-  }
-  return message;
-}
+import {
+  AntigravityError,
+  diagnosticDetails,
+  logDiagnostic,
+} from "./diagnostics.js";
 
 const permissionRequestSchema = z.object({
   sessionId: z.string().min(1),
@@ -65,6 +53,8 @@ export interface AcpPermissionOutcome {
   outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" };
 }
 interface PendingRpc {
+  method: string;
+  sessionId?: string;
   resolve(result: unknown): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout> | null;
@@ -102,6 +92,7 @@ export class AcpClient {
       stdio: "pipe",
       detached: process.platform !== "win32",
     });
+    logDiagnostic("acp.spawn", { pid: this.child.pid });
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", (chunk: string) => {
       this.stderr = (this.stderr + chunk).slice(-8192);
@@ -143,9 +134,19 @@ export class AcpClient {
           detail ||
           "Antigravity ACP exited (" + (signal ?? code ?? "unknown") + ")";
         const error = new AntigravityError(
-          formatDiagnostic(message),
+          message,
           "PROCESS_EXITED",
-          detail || undefined,
+          diagnosticDetails({ exitCode: code, signal, stderr: detail }),
+        );
+        logDiagnostic(
+          "acp.process_exit",
+          {
+            pid: this.child.pid,
+            exitCode: code,
+            signal,
+            closing: this.closing,
+          },
+          this.closing ? undefined : error,
         );
         // Apply already-received text before publishing the terminal event.
         void this.updateTail.then(() => this.fail(error));
@@ -176,6 +177,10 @@ export class AcpClient {
       .parse(response);
     this.agentCapabilities = parsed.agentCapabilities;
     this.agentVersion = parsed.agentInfo?.version ?? "";
+    logDiagnostic("acp.initialized", {
+      pid: this.child.pid,
+      agentVersion: this.agentVersion,
+    });
   }
 
   async request<T = Record<string, unknown>>(
@@ -190,15 +195,27 @@ export class AcpClient {
         timeoutMs !== null && timeoutMs > 0
           ? setTimeout(() => {
               this.pending.delete(id);
-              reject(
-                new AntigravityError(
-                  "Antigravity ACP " + method + " timed out",
-                  "TIMEOUT",
-                ),
+              const error = new AntigravityError(
+                "Antigravity ACP " + method + " timed out",
+                "TIMEOUT",
+                diagnosticDetails({ method, requestId: id, timeoutMs }),
               );
+              logDiagnostic(
+                "acp.rpc_timeout",
+                { pid: this.child.pid, method, requestId: id },
+                error,
+              );
+              reject(error);
             }, timeoutMs)
           : null;
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, {
+        method,
+        sessionId:
+          typeof params.sessionId === "string" ? params.sessionId : undefined,
+        resolve,
+        reject,
+        timer,
+      });
       void this.write({ jsonrpc: "2.0", id, method, params }).catch(
         (error: unknown) => {
           this.fail(new AntigravityError(String(error), "TRANSPORT_ERROR"));
@@ -336,14 +353,32 @@ export class AcpClient {
     void this.updateTail.then(() => {
       if (!this.pending.delete(id)) return;
       if (this.failure) pending.reject(this.failure);
-      else if (frame.error)
-        pending.reject(
-          new AntigravityError(
-            formatDiagnostic(frame.error.message),
-            "RPC_" + frame.error.code,
-          ),
+      else if (frame.error) {
+        const error = new AntigravityError(
+          frame.error.message,
+          "RPC_" + frame.error.code,
+          diagnosticDetails({
+            method: pending.method,
+            requestId: id,
+            rpcCode: frame.error.code,
+            data: frame.error.data,
+            stderr: this.stderr.trim(),
+          }),
+          frame.error.data,
         );
-      else pending.resolve(frame.result);
+        logDiagnostic(
+          "acp.rpc_failed",
+          {
+            pid: this.child.pid,
+            sessionId: pending.sessionId,
+            method: pending.method,
+            requestId: id,
+            rpcCode: frame.error.code,
+          },
+          error,
+        );
+        pending.reject(error);
+      } else pending.resolve(frame.result);
     });
   }
 
@@ -372,7 +407,12 @@ export class AcpClient {
       result = await this.options.onPermissionRequest(
         permissionRequestSchema.parse(params),
       );
-    } catch {
+    } catch (error) {
+      logDiagnostic(
+        "acp.client_request_failed",
+        { pid: this.child.pid, method, requestId: id },
+        error,
+      );
       result = { outcome: { outcome: "cancelled" } };
     }
     if (!this.closing && !this.failure)
@@ -390,6 +430,8 @@ export class AcpClient {
   private fail(error: AntigravityError): void {
     if (this.failure) return;
     this.failure = error;
+    if (!this.closing)
+      logDiagnostic("acp.transport_failed", { pid: this.child.pid }, error);
     this.rejectPending(error);
     if (!this.closing) {
       this.options.onExit?.(error);

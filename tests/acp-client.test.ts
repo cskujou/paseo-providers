@@ -61,6 +61,31 @@ describe("ACP transport", () => {
     }
   });
 
+  it("retains upstream RPC data and diagnostic context without terminating a healthy process", async () => {
+    const client = new AcpClient({
+      launch: launch(String.raw`import {createInterface} from 'node:readline';
+      createInterface({input:process.stdin}).on('line',line=>{const f=JSON.parse(line);
+      const result=f.method==='initialize'?{result:{protocolVersion:1}}:f.method==='session/prompt'?{error:{code:-32603,message:'Agent execution terminated due to error.',data:{detail:'service unavailable',token:'never log'}}}:{result:{alive:true}};
+      process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:f.id,...result})+'\n');});`),
+    });
+    try {
+      await client.initialize();
+      const failure = await client
+        .request("session/prompt", { sessionId: "fixture" }, null)
+        .catch((error) => error);
+      expect(failure).toMatchObject({
+        message: "Agent execution terminated due to error.",
+        code: "RPC_-32603",
+        data: { detail: "service unavailable", token: "never log" },
+      });
+      expect(failure.diagnostic).toContain("service unavailable");
+      expect(failure.diagnostic).not.toContain("never log");
+      expect(await client.request("test/alive", {})).toEqual({ alive: true });
+    } finally {
+      await client.close();
+    }
+  });
+
   it("fails explicitly when notification handling fails", async () => {
     const client = new AcpClient({
       launch: launch(String.raw`import {createInterface} from 'node:readline';

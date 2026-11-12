@@ -69,6 +69,16 @@ paseo-providers/
 
 启动、配置、目录查询及显式取消/关闭保留各自的协议等待和资源清理界限。这些界限不作为正常任务的执行时限；文件回退的路径、令牌和备份检查也不删除。
 
+### 诊断日志与后台续写
+
+provider 保留上游 RPC 错误的代码和原始 `data`，向 Paseo 传递错误消息、代码及脱敏后的 `diagnostic`。诊断包括请求方法、请求 ID 和错误详情；回合内失败不再只剩 `Agent execution terminated due to error.`。凭据、请求提示正文和环境字段不写入日志，诊断输出长度有限；分享日志前仍应检查上游错误文本。
+
+诊断使用 `[antigravity]` 前缀，由 Paseo 收集到 `$PASEO_HOME/daemon.log`（默认 `~/.paseo/daemon.log`）。按 `turnId` 和 `conversationId` 关联 `acp.rpc_failed`、`turn.failed`、`turn.interrupt_requested`；可区分原始执行错误、用户催进度触发的中断和随后的新回合错误。
+
+后台状态会分别显示「任务运行中」「任务完成、等待 AGY 自动续写」「AGY 已记录自动续写」和最终完成。续写的思考、工具状态和回答按新增或变化的转录项及时回传，不再等整个自动回合结束才显示。`background.observed` 记录阶段和最后一步，`background.forwarded` 记录前台回传，`background.tool` 记录续写工具状态；没有新记录时不反复刷日志，也不添加固定等待上限或自动重启。检测到失败的模型执行记录时，回合以 `BACKGROUND_CONTINUATION_FAILED` 结算；新提示忽略上一用户回合的后台错误。
+
+如果只有后台任务完成通知，没有后续模型记录，provider 不能据此假称 AGY 已唤醒，也不会盲目提交另一条提示。AGY 1.5.6 的真实测试中，`default` 模式自动续写额外 Shell 出现过阻塞，而自动读文件和 `auto` 模式的 Shell 续写通过；权限请求是否在后台回合中正确转发仍需进一步确认，不能用自动放宽权限掩盖问题。
+
 ### 回退范围与限制
 
 **文件回退会覆盖目标回合之后的工作区改动，包括手动改动。** Git 快照覆盖整个工作树中的非忽略文件，不仅是当前目录；不改动 HEAD 和真实 Git 索引。快照使用临时索引和私有 Git 引用，避免修改原有暂存状态，并防止快照对象被垃圾回收。

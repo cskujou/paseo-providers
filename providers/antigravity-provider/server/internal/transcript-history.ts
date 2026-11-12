@@ -17,6 +17,7 @@ const transcriptRecordSchema = z.object({
   content: z.string().optional(),
   thinking: z.string().optional(),
   exit_code: z.number().int().optional(),
+  error_details: z.json().optional(),
   tool_calls: z
     .array(
       z.object({
@@ -26,6 +27,8 @@ const transcriptRecordSchema = z.object({
     )
     .optional(),
 });
+export type TranscriptRecord = z.infer<typeof transcriptRecordSchema>;
+
 export type TranscriptTimelineItem = ProviderTimelineItem & {
   timestamp?: string;
 };
@@ -63,6 +66,7 @@ export async function readTranscriptSummary(
 export async function readTranscriptTimeline(
   conversationId: string,
   env: Record<string, string | undefined> = process.env,
+  live = false,
 ): Promise<TranscriptTimelineItem[]> {
   const file = await resolveTranscriptFile(conversationId, env);
   if (!file) return [];
@@ -91,6 +95,7 @@ export async function readTranscriptTimeline(
       continue;
     }
     if (type === "PLANNER_RESPONSE") {
+      if (record.status === "ERROR" || record.status === "FAILED") continue;
       const thinking = boundText(record.thinking ?? "").trim();
       if (thinking)
         items.push({
@@ -139,7 +144,11 @@ export async function readTranscriptTimeline(
     if (toolIndex < 0 || pending.length === 0) continue;
     const tool = pending.splice(toolIndex, 1)[0]!;
     tool.state.rawOutput = boundText(record.content ?? "");
-    const item = toolItem(tool.state, toolOutcome(record.status));
+    const running = record.status === "RUNNING" || record.status === "PENDING";
+    const item =
+      live && running
+        ? acpToolToTimelineItem(tool.state)
+        : toolItem(tool.state, toolOutcome(record.status));
     if (item.detail.type === "shell" && record.exit_code !== undefined)
       item.detail = { ...item.detail, exitCode: record.exit_code };
     items[tool.index] = {
@@ -147,7 +156,7 @@ export async function readTranscriptTimeline(
       timestamp: items[tool.index]?.timestamp ?? timestamp,
     };
   }
-  flushPending(items, pending);
+  if (!live) flushPending(items, pending);
   return items;
 }
 
@@ -173,6 +182,14 @@ async function resolveTranscriptFile(
     }
   }
   return null;
+}
+
+export async function* readConversationRecords(
+  conversationId: string,
+  env: Record<string, string>,
+): AsyncGenerator<TranscriptRecord> {
+  const file = await resolveTranscriptFile(conversationId, env);
+  if (file) yield* readTranscriptRecords(file.path);
 }
 
 async function* readTranscriptRecords(filePath: string) {

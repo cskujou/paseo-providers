@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { execCommand } from "@getpaseo/plugin/server";
-import { AntigravityError } from "./acp-client.js";
+import { AntigravityError } from "./diagnostics.js";
 
 export const RevertTokenSchema = z.object({
   version: z.literal(1),

@@ -10,7 +10,13 @@ async function run(mode: string): Promise<unknown> {
   const { stdout } = await exec(process.execPath, [fixture, mode], {
     timeout: 20000,
   });
-  return JSON.parse(stdout.trim().split("\n").at(-1)!);
+  const result = stdout
+    .trim()
+    .split("\n")
+    .filter((line) => !line.startsWith("[antigravity]"))
+    .at(-1);
+  if (!result) throw new Error("Host fixture did not return a result");
+  return JSON.parse(result);
 }
 
 describe("compiled provider through the real Paseo 0.14 host", () => {
@@ -79,6 +85,24 @@ describe("compiled provider through the real Paseo 0.14 host", () => {
       restoredInfo: { model: "claude-opus-5-5" },
     });
   }, 20000);
+  it("preserves upstream failures and safe diagnostic details in the actual host event", async () => {
+    expect(await run("diagnostics")).toMatchObject({
+      message: "Agent execution terminated due to error.",
+      code: "RPC_-32603",
+      diagnostic: expect.stringContaining("service temporarily unavailable"),
+      followUpSucceeded: true,
+    });
+  }, 20000);
+
+  it("publishes automatic tools before ending the foreground host run", async () => {
+    expect(await run("background-stream")).toEqual({
+      endedBeforeTools: false,
+      finalText: "STREAM_DONE",
+      readStatuses: ["running", "completed"],
+      turns: ["turn_started", "turn_completed"],
+    });
+  }, 20000);
+
   it("keeps description-only previews working for other plugin providers", async () => {
     expect(await run("legacy")).toEqual([
       { firstPromptPreview: null, lastPromptPreview: "old-style preview" },

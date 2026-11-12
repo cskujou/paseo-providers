@@ -74,8 +74,8 @@ function send(value) {
 function reply(request, result = {}) {
   send({ id: request.id, result });
 }
-function error(request, message, code = -32602) {
-  send({ id: request.id, error: { code, message } });
+function error(request, message, code = -32602, data) {
+  send({ id: request.id, error: { code, message, data } });
 }
 function update(sessionUpdate, fields) {
   return {
@@ -243,6 +243,7 @@ input.on("line", (line) => {
       if (
         text === "background-transcript" ||
         text === "background-held" ||
+        text === "background-late" ||
         text === "background-daemon"
       ) {
         const logs = path.join(
@@ -289,10 +290,11 @@ input.on("line", (line) => {
             content: "waiting",
           },
         ];
-        writeFileSync(
-          file,
-          records.map((r) => JSON.stringify(r)).join("\n") + "\n",
-        );
+        if (text !== "background-late")
+          writeFileSync(
+            file,
+            records.map((r) => JSON.stringify(r)).join("\n") + "\n",
+          );
         send(
           update("tool_call", {
             toolCallId: "background-call",
@@ -333,6 +335,15 @@ input.on("line", (line) => {
       }
       if (text === "hold") {
         activePrompt = f;
+        break;
+      }
+      if (text === "upstream-error") {
+        error(f, "Agent execution terminated due to error.", -32603, {
+          detail: "service temporarily unavailable",
+          reason: "upstream",
+          token: "private-token",
+          request: { prompt: "do not log task" },
+        });
         break;
       }
       if (text === "fail-process") {

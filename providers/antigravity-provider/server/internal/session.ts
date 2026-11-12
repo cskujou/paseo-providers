@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { readBackgroundTurn } from "./background.js";
+import {
+  AntigravityError,
+  providerError,
+  logDiagnostic,
+  diagnosticDetails,
+} from "./diagnostics.js";
 import { z } from "zod";
 import type {
   ProviderCatalog,
@@ -21,8 +27,6 @@ import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { AntigravityUsage } from "../usage.js";
 import {
   AcpClient,
-  AntigravityError,
-  formatDiagnostic,
   type AcpPermissionOutcome,
   type AcpPermissionRequestParams,
   type AcpSessionUpdateParams,
@@ -106,6 +110,8 @@ interface ActiveTurn {
   completion: Promise<void>;
   resolve(): void;
   activity: ReturnType<typeof Promise.withResolvers<void>>;
+  backgroundPhase?: string;
+  backgroundAfterStep?: number;
 }
 
 type ProviderRevertScope = Extract<
@@ -297,6 +303,10 @@ export class Session {
           "NO_CONVERSATION",
         );
       const { acpPrompt, displayText } = this.encodePrompt(prompt);
+      const previousBackground = await readBackgroundTurn(
+        this.conversationId,
+        this.mergedEnv,
+      );
       const revertToken = await this.rewindTracker.createTurnToken(
         this.conversationId,
         prompt.clientMessageId,
@@ -313,8 +323,16 @@ export class Session {
         completion: completion.promise,
         resolve: completion.resolve,
         activity: Promise.withResolvers<void>(),
+        backgroundAfterStep: previousBackground?.lastStep,
       };
       this.activeTurn = turn;
+      logDiagnostic("turn.started", {
+        sessionId: this.options.id,
+        conversationId: this.conversationId,
+        turnId: turn.id,
+        model: this.config.model,
+        mode: this.config.mode,
+      });
       this.messages.clear();
       for (const id of this.toolCalls.keys()) this.retiredToolCalls.add(id);
       this.toolCalls.clear();
@@ -359,6 +377,15 @@ export class Session {
             ),
           );
         if (this.activeTurn !== turn) return;
+        logDiagnostic("turn.prompt_response", {
+          sessionId: this.options.id,
+          conversationId: this.conversationId,
+          turnId: turn.id,
+          stopReason: response.stopReason,
+          runningTools: [...this.toolCalls.values()].filter(
+            (t) => t.status === "pending" || t.status === "in_progress",
+          ).length,
+        });
         const canceled = turn.canceled || response.stopReason === "cancelled";
         if (!canceled && response.stopReason !== "end_turn")
           throw new AntigravityError(
@@ -375,6 +402,12 @@ export class Session {
           if (this.activeTurn !== turn) return;
           this.finishRunningTools("canceled");
         }
+        logDiagnostic("turn.settled", {
+          sessionId: this.options.id,
+          conversationId: this.conversationId,
+          turnId: turn.id,
+          state: turn.canceled || canceled ? "canceled" : "completed",
+        });
         this.emit({
           type: "session.turn",
           sessionId: this.options.id,
@@ -384,20 +417,38 @@ export class Session {
       } catch (error) {
         if (this.activeTurn !== turn) return;
         this.finishRunningTools(turn.canceled ? "canceled" : "failed");
-        const message = error instanceof Error ? error.message : String(error);
+        logDiagnostic(
+          "turn.failed",
+          {
+            sessionId: this.options.id,
+            conversationId: this.conversationId,
+            turnId: turn.id,
+            canceled: turn.canceled,
+          },
+          error,
+        );
         this.emit({
           type: "session.turn",
           sessionId: this.options.id,
           turnId: turn.id,
           state: turn.canceled ? "canceled" : "failed",
-          ...(turn.canceled
-            ? {}
-            : { error: { message: formatDiagnostic(message) } }),
+          ...(turn.canceled ? {} : { error: providerError(error) }),
         });
       } finally {
         if (this.activeTurn === turn) this.activeTurn = null;
         this.cancelPendingPermissions();
         this.fallbackChunkIds.clear();
+        if (turn.canceled && turn.backgroundPhase)
+          this.emit({
+            type: "session.notice",
+            sessionId: this.options.id,
+            notice: {
+              id: "background:" + turn.id,
+              severity: "info",
+              title: "Background waiting canceled",
+              dismissed: true,
+            },
+          });
         turn.activity.resolve();
         turn.resolve();
       }
@@ -406,64 +457,197 @@ export class Session {
     }
   }
 
-  private async waitForBackgroundTurn(turn: ActiveTurn): Promise<void> {
-    if (!this.conversationId) return;
+  private async waitForBackgroundTurn(turn: ActiveTurn): Promise<boolean> {
+    if (!this.conversationId) return false;
     let snapshot = await readBackgroundTurn(
       this.conversationId,
       this.mergedEnv,
     );
-    if (!snapshot) return;
-    while (this.activeTurn === turn && !turn.canceled && !snapshot.settled) {
+    if (
+      !snapshot ||
+      (turn.backgroundAfterStep !== undefined &&
+        (snapshot.userStep === undefined ||
+          snapshot.userStep <= turn.backgroundAfterStep))
+    )
+      return false;
+    const published = new Map<string, string>();
+    let projectedRevision: string | undefined;
+    let observation: string | undefined;
+    let transcriptAvailable = true;
+    const noticeId = "background:" + turn.id;
+    while (this.activeTurn === turn && !turn.canceled) {
+      this.hasDaemonTasks ||= snapshot.tasks.some(
+        (task) => task.daemon && !task.completed,
+      );
+      const running = snapshot.tasks.filter(
+        (task) => !task.daemon && !task.completed,
+      ).length;
+      let phase = "awaiting_continuation";
+      if (snapshot.failure) phase = "continuation_failed";
+      else if (snapshot.settled) phase = "completed";
+      else if (running) phase = "task_running";
+      else if (snapshot.continuationStarted) phase = "continuation_running";
+      const changed = JSON.stringify([
+        phase,
+        snapshot.lastStep,
+        snapshot.tasks.map((task) => [task.id, task.completed, task.exitCode]),
+      ]);
+      if (changed !== observation) {
+        observation = changed;
+        logDiagnostic("background.observed", {
+          sessionId: this.options.id,
+          conversationId: this.conversationId,
+          turnId: turn.id,
+          phase,
+          runningTasks: running,
+          completedTasks: snapshot.tasks.filter((task) => task.completed)
+            .length,
+          lastStep: snapshot.lastStep,
+        });
+      }
+      if (turn.backgroundPhase !== phase) {
+        turn.backgroundPhase = phase;
+        const titles: Record<string, string> = {
+          task_running: "Background task is running",
+          awaiting_continuation:
+            "Background task finished; waiting for AGY automatic continuation",
+          continuation_running: "AGY automatic continuation is running",
+          completed: "Background task and automatic continuation finished",
+          continuation_failed: "AGY automatic continuation failed",
+        };
+        this.emit({
+          type: "session.notice",
+          sessionId: this.options.id,
+          notice: {
+            id: noticeId,
+            severity: snapshot.failure ? "error" : "info",
+            title: titles[phase]!,
+          },
+        });
+      }
+      for (const task of snapshot.tasks) {
+        if (!task.completed && !task.daemon) continue;
+        for (const [id, state] of this.toolCalls) {
+          const input = state.rawInput;
+          if (
+            state.name !== "run_command" ||
+            !input ||
+            typeof input !== "object" ||
+            Array.isArray(input) ||
+            input.CommandLine !== task.command
+          )
+            continue;
+          const next = {
+            ...state,
+            status:
+              task.exitCode !== undefined && task.exitCode !== 0
+                ? ("failed" as const)
+                : ("completed" as const),
+            rawOutput: task.output,
+          };
+          const item = acpToolToTimelineItem(next);
+          if (item.detail.type === "shell")
+            item.detail = { ...item.detail, exitCode: task.exitCode };
+          const fingerprint = JSON.stringify(item);
+          if (published.get("acp:" + id) !== fingerprint) {
+            published.set("acp:" + id, fingerprint);
+            this.toolCalls.set(id, next);
+            this.emitItem(item);
+          }
+        }
+      }
+      // ACP can go silent after its foreground response while AGY continues.
+      // Send new and changed transcript items immediately, not only at final settlement.
+      if (
+        snapshot.continuationStep !== undefined &&
+        snapshot.continuationRevision !== projectedRevision
+      ) {
+        const items = await readTranscriptTimeline(
+          this.conversationId,
+          this.mergedEnv,
+          true,
+        );
+        if (this.activeTurn !== turn || turn.canceled) return true;
+        projectedRevision = snapshot.continuationRevision;
+        let updated = 0;
+        for (const item of items) {
+          const step = /^history:(\d+):/.exec(item.id);
+          if (!step || Number(step[1]) < snapshot.continuationStep) continue;
+          const fingerprint = JSON.stringify(item);
+          if (published.get(item.id) === fingerprint) continue;
+          published.set(item.id, fingerprint);
+          this.emitItem(item);
+          if (item.type === "tool_call")
+            logDiagnostic("background.tool", {
+              sessionId: this.options.id,
+              conversationId: this.conversationId,
+              turnId: turn.id,
+              toolId: item.id,
+              name: item.name,
+              status: item.status,
+            });
+          updated++;
+        }
+        if (updated)
+          logDiagnostic("background.forwarded", {
+            sessionId: this.options.id,
+            conversationId: this.conversationId,
+            turnId: turn.id,
+            items: updated,
+            lastStep: snapshot.lastStep,
+          });
+      }
+      if (snapshot.failure)
+        throw new AntigravityError(
+          snapshot.failure.message,
+          "BACKGROUND_CONTINUATION_FAILED",
+          diagnosticDetails({
+            stage: "automatic_continuation",
+            step: snapshot.lastStep,
+            details: snapshot.failure.details,
+          }),
+          snapshot.failure.details,
+        );
+      if (snapshot.settled) {
+        this.emit({
+          type: "session.notice",
+          sessionId: this.options.id,
+          notice: {
+            id: noticeId,
+            severity: "info",
+            title: "Background work finished",
+            dismissed: true,
+          },
+        });
+        return true;
+      }
       await Promise.race([delay(250), turn.activity.promise]);
-      if (this.activeTurn !== turn || turn.canceled) return;
+      if (this.activeTurn !== turn || turn.canceled) return true;
       turn.activity = Promise.withResolvers<void>();
       const updated = await readBackgroundTurn(
         this.conversationId,
         this.mergedEnv,
       );
-      if (updated) snapshot = updated;
-    }
-    if (this.activeTurn !== turn || turn.canceled) return;
-    this.hasDaemonTasks ||= snapshot.tasks.some(
-      (task) => task.daemon && !task.completed,
-    );
-    for (const task of snapshot.tasks) {
-      for (const [id, state] of this.toolCalls) {
-        const input = state.rawInput;
-        if (
-          state.name !== "run_command" ||
-          !input ||
-          typeof input !== "object" ||
-          Array.isArray(input) ||
-          input.CommandLine !== task.command
-        )
-          continue;
-        const next = {
-          ...state,
-          status:
-            task.exitCode !== undefined && task.exitCode !== 0
-              ? ("failed" as const)
-              : ("completed" as const),
-          rawOutput: task.output,
-        };
-        this.toolCalls.set(id, next);
-        const item = acpToolToTimelineItem(next);
-        if (item.detail.type === "shell")
-          item.detail = { ...item.detail, exitCode: task.exitCode };
-        this.emitItem(item);
+      if (this.activeTurn !== turn || turn.canceled) return true;
+      if (updated) {
+        snapshot = updated;
+        if (!transcriptAvailable)
+          logDiagnostic("background.transcript_restored", {
+            sessionId: this.options.id,
+            conversationId: this.conversationId,
+            turnId: turn.id,
+          });
+        transcriptAvailable = true;
+      } else if (transcriptAvailable) {
+        transcriptAvailable = false;
+        logDiagnostic("background.transcript_unavailable", {
+          sessionId: this.options.id,
+          conversationId: this.conversationId,
+          turnId: turn.id,
+        });
       }
     }
-    if (snapshot.continuationStep === undefined) return;
-    // Only publish the autonomous continuation, not the already streamed foreground.
-    for (const item of await readTranscriptTimeline(
-      this.conversationId,
-      this.mergedEnv,
-    )) {
-      const step = /^history:(\d+):/.exec(item.id);
-      if (step && Number(step[1]) >= snapshot.continuationStep!)
-        this.emitItem(item);
-    }
-    return;
+    return true;
   }
 
   private async waitForTurnTools(turn: ActiveTurn): Promise<void> {
@@ -473,7 +657,9 @@ export class Session {
       this.hasRunningTools()
     ) {
       turn.activity = Promise.withResolvers<void>();
-      await turn.activity.promise;
+      await Promise.race([delay(250), turn.activity.promise]);
+      if (this.activeTurn === turn && !turn.canceled)
+        await this.waitForBackgroundTurn(turn);
     }
   }
 
@@ -701,6 +887,12 @@ export class Session {
     const turn = this.activeTurn;
     const client = this.client;
     if (!turn || !client || !this.conversationId) return;
+    logDiagnostic("turn.interrupt_requested", {
+      sessionId: this.options.id,
+      conversationId: this.conversationId,
+      turnId: turn.id,
+      backgroundPhase: turn.backgroundPhase,
+    });
     turn.canceled = true;
     turn.activity.resolve();
     this.cancelPendingPermissions();
@@ -737,6 +929,11 @@ export class Session {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    logDiagnostic("session.close_requested", {
+      sessionId: this.options.id,
+      conversationId: this.conversationId,
+      turnId: this.activeTurn?.id,
+    });
     this.pendingPrompt?.abort();
     this.cancelPendingPermissions();
     const client = this.client;
@@ -1471,6 +1668,15 @@ export class Session {
 
   private handleUnexpectedExit(error: AntigravityError): void {
     if (this.closed || this.restarting) return;
+    logDiagnostic(
+      "session.runtime_failed",
+      {
+        sessionId: this.options.id,
+        conversationId: this.conversationId,
+        turnId: this.activeTurn?.id,
+      },
+      error,
+    );
     this.client = null;
     this.hasDaemonTasks = false;
     this.cancelPendingPermissions();
@@ -1485,21 +1691,13 @@ export class Session {
         sessionId: this.options.id,
         turnId,
         state: "failed",
-        error: {
-          message: error.message,
-          code: error.code,
-          diagnostic: error.diagnostic,
-        },
+        error: providerError(error),
       });
     } else {
       this.emit({
         type: "session.runtime_failed",
         sessionId: this.options.id,
-        error: {
-          message: error.message,
-          code: error.code,
-          diagnostic: error.diagnostic,
-        },
+        error: providerError(error),
       });
     }
   }

@@ -696,6 +696,29 @@ describe("Antigravity provider public contract", () => {
     ).toHaveLength(1);
   });
 
+  it("passes upstream code and detail to the failed turn and preserves the process for a follow-up", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("error", "upstream-error");
+    const failed = await h.wait("session.turn", (e) => e.state === "failed");
+    expect(failed.error).toMatchObject({
+      message: "Agent execution terminated due to error.",
+      code: "RPC_-32603",
+    });
+    expect(failed.error?.diagnostic).toContain(
+      "service temporarily unavailable",
+    );
+    expect(failed.error?.diagnostic).not.toContain("private-token");
+    expect(failed.error?.diagnostic).not.toContain("do not log task");
+    await h.prompt("next", "next");
+    await h.wait("session.turn", (e) => e.state === "completed");
+    expect(
+      (await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8"))
+        .trim()
+        .split("\n"),
+    ).toHaveLength(1);
+  });
+
   it("does not kill a healthy process when the model reaches a token limit", async () => {
     const h = await harness();
     await h.open();
@@ -708,6 +731,277 @@ describe("Antigravity provider public contract", () => {
         .trim()
         .split("\n"),
     ).toHaveLength(1);
+  });
+
+  it("forwards automatic thinking and tools while the background continuation is still running", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("background", "background-held");
+    await h.wait(
+      "session.notice",
+      (e) => e.notice.title === "Background task is running",
+    );
+    const file = path.join(
+      h.cwd,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "fixture",
+      ".system_generated",
+      "logs",
+      "transcript_full.jsonl",
+    );
+    let records = await readFile(file, "utf8");
+    async function append(record: object) {
+      records += JSON.stringify(record) + "\n";
+      await writeFile(file, records);
+    }
+    await append({
+      type: "SYSTEM_MESSAGE",
+      step_index: 4,
+      status: "DONE",
+      content:
+        'Task id "fixture/task-2" finished with result:\nCommand exited with code 0.',
+    });
+    await h.wait("session.notice", (e) =>
+      e.notice.title.includes("waiting for AGY automatic continuation"),
+    );
+    expect(
+      h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+    ).toEqual(["started"]);
+    await append({
+      type: "PLANNER_RESPONSE",
+      step_index: 5,
+      status: "DONE",
+      thinking: "woken up",
+      tool_calls: [{ name: "read_file", args: { Path: "/tmp/result.txt" } }],
+    });
+    await h.wait(
+      "timeline.item",
+      (e) => e.item.type === "reasoning" && e.item.text === "woken up",
+    );
+    const started = await h.wait(
+      "timeline.item",
+      (e) =>
+        e.item.type === "tool_call" &&
+        e.item.detail.type === "read" &&
+        e.item.status === "running",
+    );
+    await h.wait(
+      "session.notice",
+      (e) => e.notice.title === "AGY automatic continuation is running",
+    );
+    await append({
+      type: "GENERIC",
+      step_index: 6,
+      status: "DONE",
+      content: "read result",
+    });
+    await h.wait(
+      "timeline.item",
+      (e) =>
+        e.item.type === "tool_call" &&
+        e.item.id === started.item.id &&
+        e.item.status === "completed",
+    );
+    expect(
+      h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+    ).toEqual(["started"]);
+    await append({
+      type: "PLANNER_RESPONSE",
+      step_index: 7,
+      status: "DONE",
+      content: "CONTINUED_DONE",
+    });
+    await h.wait("session.turn", (e) => e.state === "completed");
+    const readUpdates = h.events
+      .filter((e) => e.type === "timeline.item")
+      .filter(
+        (e) => e.item.type === "tool_call" && e.item.id === started.item.id,
+      );
+    expect(
+      readUpdates.map((e) =>
+        e.item.type === "tool_call" ? e.item.status : "",
+      ),
+    ).toEqual(["running", "completed"]);
+    expect(
+      h.events
+        .filter((e) => e.type === "timeline.item")
+        .filter(
+          (e) => e.item.type === "reasoning" && e.item.text === "woken up",
+        ),
+    ).toHaveLength(1);
+  });
+
+  it("reports a transcript-only continuation failure before a user needs to ask for progress", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("background", "background-held");
+    await h.wait(
+      "session.notice",
+      (e) => e.notice.title === "Background task is running",
+    );
+    const file = path.join(
+      h.cwd,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "fixture",
+      ".system_generated",
+      "logs",
+      "transcript_full.jsonl",
+    );
+    const records = await readFile(file, "utf8");
+    await writeFile(
+      file,
+      records +
+        JSON.stringify({
+          type: "SYSTEM_MESSAGE",
+          step_index: 4,
+          status: "DONE",
+          content:
+            'Task id "fixture/task-2" finished with result:\nCommand exited with code 0.',
+        }) +
+        "\n",
+    );
+    await h.wait("session.notice", (e) =>
+      e.notice.title.includes("waiting for AGY"),
+    );
+    await h.prompt("progress", "progress?");
+    const admission = await h.wait(
+      "session.prompt_result",
+      (e) => e.clientMessageId === "progress",
+    );
+    expect(admission.result).toMatchObject({
+      type: "failed",
+      error: { code: "TURN_ACTIVE" },
+    });
+    await writeFile(
+      file,
+      records +
+        [
+          {
+            type: "SYSTEM_MESSAGE",
+            step_index: 4,
+            status: "DONE",
+            content:
+              'Task id "fixture/task-2" finished with result:\nCommand exited with code 0.',
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 5,
+            status: "ERROR",
+            content: "Agent execution terminated due to error.",
+            error_details: { reason: "upstream unavailable", token: "private" },
+          },
+        ]
+          .map((r) => JSON.stringify(r))
+          .join("\n") +
+        "\n",
+    );
+    const failed = await h.wait("session.turn", (e) => e.state === "failed");
+    expect(failed.error).toMatchObject({
+      code: "BACKGROUND_CONTINUATION_FAILED",
+      message: "Agent execution terminated due to error.",
+    });
+    expect(failed.error?.diagnostic).toContain("upstream unavailable");
+    expect(failed.error?.diagnostic).not.toContain("private");
+    await h.prompt("next", "next");
+    await h.wait("session.turn", (e) => e.state === "completed");
+  });
+
+  it("keeps error diagnostics when progress replaces a background-waiting turn", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("background", "background-held");
+    await h.wait(
+      "session.notice",
+      (e) => e.notice.title === "Background task is running",
+    );
+    await h.connection.send({
+      type: "session.interrupt",
+      sessionId: "s",
+      requestId: "replace",
+    });
+    await h.wait("request.completed", (e) => e.requestId === "replace");
+    await h.wait("session.turn", (e) => e.state === "canceled");
+    await h.prompt("progress", "upstream-error");
+    const failed = await h.wait("session.turn", (e) => e.state === "failed");
+    expect(failed.error).toMatchObject({ code: "RPC_-32603" });
+    expect(failed.error?.diagnostic).toContain(
+      "service temporarily unavailable",
+    );
+    expect(
+      h.events.filter((e) => e.type === "session.turn").map((e) => e.state),
+    ).toEqual(["started", "canceled", "started", "failed"]);
+  });
+
+  it("detects background work even when the transcript appears after the prompt response", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("late", "background-late");
+    await h.wait(
+      "timeline.item",
+      (e) => e.item.type === "assistant_message" && e.item.text === "waiting",
+    );
+    const file = path.join(
+      h.cwd,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "fixture",
+      ".system_generated",
+      "logs",
+      "transcript_full.jsonl",
+    );
+    await writeFile(
+      file,
+      [
+        { type: "USER_INPUT", step_index: 0, content: "test" },
+        {
+          type: "PLANNER_RESPONSE",
+          step_index: 1,
+          tool_calls: [
+            { name: "run_command", args: { CommandLine: "sleep 18" } },
+          ],
+        },
+        {
+          type: "GENERIC",
+          step_index: 2,
+          status: "RUNNING",
+          content:
+            "Tool is running as a background task with task id: fixture/task-2",
+        },
+        {
+          type: "PLANNER_RESPONSE",
+          step_index: 3,
+          status: "DONE",
+          content: "waiting",
+        },
+        {
+          type: "SYSTEM_MESSAGE",
+          step_index: 4,
+          status: "DONE",
+          content:
+            'Task id "fixture/task-2" finished with result:\nCommand exited with code 0.',
+        },
+        {
+          type: "PLANNER_RESPONSE",
+          step_index: 5,
+          status: "DONE",
+          content: "LATE_BACKGROUND_DONE",
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n"),
+    );
+    await h.wait("session.turn", (e) => e.state === "completed");
+    expect(
+      h.events
+        .filter((e) => e.type === "timeline.item")
+        .filter((e) => e.item.type === "assistant_message")
+        .at(-1)?.item,
+    ).toMatchObject({ text: "LATE_BACKGROUND_DONE" });
   });
 
   it("does not advertise steering without a native acknowledgement", async () => {

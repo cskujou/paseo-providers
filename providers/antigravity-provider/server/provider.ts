@@ -14,11 +14,13 @@ import {
   type ProviderRegistration,
   type ProviderStatus,
 } from "@getpaseo/plugin/server/provider";
+import { AcpClient } from "./internal/acp-client.js";
 import {
-  AcpClient,
   AntigravityError,
   formatDiagnostic,
-} from "./internal/acp-client.js";
+  providerError,
+  logDiagnostic,
+} from "./internal/diagnostics.js";
 import { catalogFromModelOutput, fallbackCatalog } from "./internal/catalog.js";
 import { Session } from "./internal/session.js";
 import { readTranscriptSummary } from "./internal/transcript-history.js";
@@ -348,11 +350,16 @@ function createConnection(
   }
 
   function handleDispatchError(input: ProviderInput, failure: unknown): void {
-    const rawMessage =
-      failure instanceof Error ? failure.message : String(failure);
-    const code =
-      failure instanceof AntigravityError ? failure.code : "ANTIGRAVITY_ERROR";
-    const error = { message: formatDiagnostic(rawMessage), code };
+    const error = providerError(failure);
+    logDiagnostic(
+      "provider.dispatch_failed",
+      {
+        inputType: input.type,
+        sessionId: "sessionId" in input ? input.sessionId : undefined,
+        requestId: "requestId" in input ? input.requestId : undefined,
+      },
+      failure,
+    );
 
     if (input.type === "session.prompt") {
       emit({
