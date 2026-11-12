@@ -84,6 +84,17 @@ describe("core patches", () => {
     expect(second.output).toContain("already patched");
   });
 
+  it("preserves the 0.15.3 native rewind replay instead of inserting the legacy truncation patch", async () => {
+    const native = coreLines.join("\n").replace("    async revert(messageId, scope) {", "    async replayBinding() {\n        await this.ensureReplay();\n        this.replay = { persistence, config: this.bridge.config, messageId, scope, closed: false };\n    }\n    async revert(messageId, scope) {");
+    const root = await fakeServer({[corePath]:native});
+    const result = await run(root);
+    expect(result.code).toBe(0);
+    expect(result.output).toContain("legacy rewind patch skipped");
+    const patched = await readFile(path.join(root,corePath),"utf8");
+    expect(patched).not.toContain("this.history.length = index;");
+    expect(patched).toContain("async replayBinding()");
+  });
+
   it("fails loudly when the host revert code no longer matches", async () => {
     const changed = coreLines.filter(
       (line) => !line.startsWith("        await this.bridge.revert"),

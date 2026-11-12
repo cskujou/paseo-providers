@@ -24,7 +24,12 @@ let pluginProviderSrc = fs.readFileSync(pluginProviderPath, "utf8");
 const rewindPatchApplied =
   pluginProviderSrc.includes("this.history.length = index;") &&
   pluginProviderSrc.includes("this.timelineSnapshots.clear();");
-if (rewindPatchApplied) {
+const nativeRewindReplay = pluginProviderSrc.includes("async replayBinding() {") &&
+  pluginProviderSrc.includes("this.replay = { persistence, config: this.bridge.config, messageId, scope, closed: false };") &&
+  pluginProviderSrc.includes("await this.ensureReplay();");
+if (nativeRewindReplay) {
+  console.log("  = Paseo native rewind history replay detected; legacy rewind patch skipped");
+} else if (rewindPatchApplied) {
   console.log("  = server/agent/plugin-provider.js already patched");
 } else {
   const target = `        await this.bridge.revert({
