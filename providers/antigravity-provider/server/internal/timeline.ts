@@ -232,8 +232,10 @@ export function buildToolDetail(state: AcpToolCallState): ProviderToolCallDetail
   if (lowerName === "search_web") {
     const query = asString(input.query) ?? state.title;
     return {
-      type: "web_search",
+      type: "search",
+      toolName: "web_search",
       query,
+      content: outputStr,
     };
   }
 
@@ -258,6 +260,7 @@ export function buildToolDetail(state: AcpToolCallState): ProviderToolCallDetail
       type: "sub_agent",
       subAgentType: asString(input.TypeName) ?? asString(input.Role) ?? "subagent",
       description: asString(input.Prompt) ?? asString(input.Role) ?? state.title,
+      log: outputStr ?? "",
     };
   }
 
