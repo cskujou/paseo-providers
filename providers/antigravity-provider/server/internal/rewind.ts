@@ -96,6 +96,247 @@ export function resolveTranscriptDir(
   );
 }
 
+export function hasConversationDb(
+  nativeSessionId: string,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return existsSync(resolveConversationDbPath(nativeSessionId, env));
+}
+
+export interface ConversationTurnError {
+  stepIndex: number;
+  userMessage: string;
+  shortError?: string;
+  fullError?: string;
+  details?: string;
+  httpStatus?: number;
+}
+
+export interface CompactionStepInfo {
+  stepIndex: number;
+  status: "loading" | "completed";
+  preTokens?: number;
+  timestamp?: string;
+}
+
+type ProtoField =
+  | { field: number; wireType: 0; value: number }
+  | { field: number; wireType: 2; bytes: Uint8Array };
+
+function readProtoFields(buffer: Uint8Array): ProtoField[] {
+  const fields: ProtoField[] = [];
+  let offset = 0;
+  const readVarint = (): bigint | null => {
+    let result = 0n;
+    let shift = 0n;
+    while (offset < buffer.length) {
+      const byte = buffer[offset++]!;
+      result |= BigInt(byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) return result;
+      shift += 7n;
+      if (shift > 70n) return null;
+    }
+    return null;
+  };
+  while (offset < buffer.length) {
+    const tag = readVarint();
+    if (tag === null || tag <= 0n) break;
+    const field = Number(tag >> 3n);
+    const wireType = Number(tag & 7n);
+    if (wireType === 0) {
+      const value = readVarint();
+      if (value === null) break;
+      fields.push({ field, wireType: 0, value: Number(value) });
+    } else if (wireType === 1) {
+      if (offset + 8 > buffer.length) break;
+      offset += 8;
+    } else if (wireType === 2) {
+      const lengthBig = readVarint();
+      if (lengthBig === null || lengthBig < 0n) break;
+      const length = Number(lengthBig);
+      if (!Number.isSafeInteger(length) || offset + length > buffer.length)
+        break;
+      fields.push({
+        field,
+        wireType: 2,
+        bytes: buffer.subarray(offset, offset + length),
+      });
+      offset += length;
+    } else if (wireType === 5) {
+      if (offset + 4 > buffer.length) break;
+      offset += 4;
+    } else {
+      break;
+    }
+  }
+  return fields;
+}
+
+function protoString(
+  fields: readonly ProtoField[],
+  fieldNumber: number,
+): string | undefined {
+  const entry = fields.find(
+    (item): item is Extract<ProtoField, { wireType: 2 }> =>
+      item.wireType === 2 && item.field === fieldNumber,
+  );
+  if (!entry) return undefined;
+  const decoded = Buffer.from(
+    entry.bytes.buffer,
+    entry.bytes.byteOffset,
+    entry.bytes.byteLength,
+  ).toString("utf8");
+  return decoded.trim() ? decoded : undefined;
+}
+
+function protoVarint(
+  fields: readonly ProtoField[],
+  fieldNumber: number,
+): number | undefined {
+  const entry = fields.find(
+    (item): item is Extract<ProtoField, { wireType: 0 }> =>
+      item.wireType === 0 && item.field === fieldNumber,
+  );
+  return entry?.value;
+}
+
+function protoMessage(
+  fields: readonly ProtoField[],
+  fieldNumber: number,
+): ProtoField[] | undefined {
+  const entry = fields.find(
+    (item): item is Extract<ProtoField, { wireType: 2 }> =>
+      item.wireType === 2 && item.field === fieldNumber,
+  );
+  return entry ? readProtoFields(entry.bytes) : undefined;
+}
+
+function parseStepMetadata(raw: unknown): {
+  timestamp?: string;
+  preTokens?: number;
+} {
+  if (!(raw instanceof Uint8Array) || raw.byteLength === 0) return {};
+  const meta = readProtoFields(raw);
+  const created = protoMessage(meta, 1);
+  const seconds = created ? protoVarint(created, 1) : undefined;
+  const nanos = created ? (protoVarint(created, 2) ?? 0) : 0;
+  const timestamp =
+    seconds !== undefined && Number.isFinite(seconds) && seconds > 0
+      ? new Date(seconds * 1000 + Math.floor(nanos / 1_000_000)).toISOString()
+      : undefined;
+  const usage = protoMessage(meta, 9);
+  const uncachedInput = usage ? (protoVarint(usage, 2) ?? 0) : 0;
+  const cachedInput = usage ? (protoVarint(usage, 5) ?? 0) : 0;
+  const totalInput = uncachedInput + cachedInput;
+  return {
+    ...(timestamp ? { timestamp } : {}),
+    ...(Number.isFinite(totalInput) && totalInput > 0
+      ? { preTokens: totalInput }
+      : {}),
+  };
+}
+
+function parseStepErrorPayload(
+  stepIndex: number,
+  raw: unknown,
+): ConversationTurnError | null {
+  if (!(raw instanceof Uint8Array) || raw.byteLength === 0) return null;
+  const top = readProtoFields(raw);
+  const errorStep = protoMessage(top, 24);
+  if (!errorStep) return null;
+  const isInternal = protoVarint(errorStep, 4) === 1;
+  const shouldShowUser = protoVarint(errorStep, 5) === 1;
+  const info = protoMessage(errorStep, 3);
+  const userMessage = info ? protoString(info, 1) : undefined;
+  if (isInternal && !shouldShowUser && !userMessage) return null;
+  const shortError = info
+    ? (protoString(info, 2) ?? protoString(info, 9))
+    : undefined;
+  const fullError = info ? protoString(info, 3) : undefined;
+  const details = info ? protoString(info, 5) : undefined;
+  const httpStatus = info ? protoVarint(info, 7) : undefined;
+  if (!shouldShowUser && !userMessage && !shortError) return null;
+  return {
+    stepIndex,
+    userMessage: userMessage ?? "Agent execution terminated due to error.",
+    ...(shortError ? { shortError } : {}),
+    ...(fullError ? { fullError } : {}),
+    ...(details ? { details } : {}),
+    ...(httpStatus !== undefined && httpStatus > 0 ? { httpStatus } : {}),
+  };
+}
+
+export function readConversationTurnError(
+  nativeSessionId: string,
+  minStepIndex: number,
+  env: Record<string, string | undefined> = process.env,
+): ConversationTurnError | null {
+  const dbPath = resolveConversationDbPath(nativeSessionId, env);
+  if (!existsSync(dbPath)) return null;
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 2000 });
+    const rows = db
+      .prepare(
+        "SELECT idx, step_type, status, step_payload FROM steps WHERE idx >= ? ORDER BY idx DESC",
+      )
+      .all(minStepIndex);
+    for (const row of rows) {
+      const stepType = Number(row["step_type"]);
+      const status = Number(row["status"]);
+      if (stepType === 15 && status === 3) return null;
+      if (stepType === 17) {
+        const parsed = parseStepErrorPayload(
+          Number(row["idx"]),
+          row["step_payload"],
+        );
+        if (parsed) return parsed;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
+export function readCompactionSteps(
+  nativeSessionId: string,
+  env: Record<string, string | undefined> = process.env,
+  minStepIndex = 0,
+): CompactionStepInfo[] {
+  const dbPath = resolveConversationDbPath(nativeSessionId, env);
+  if (!existsSync(dbPath)) return [];
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 2000 });
+    const rows = db
+      .prepare(
+        "SELECT idx, status, metadata FROM steps WHERE step_type = 23 AND idx >= ? ORDER BY idx ASC",
+      )
+      .all(minStepIndex);
+    const items: CompactionStepInfo[] = [];
+    for (const row of rows) {
+      const stepIndex = Number(row["idx"]);
+      const statusCode = Number(row["status"]);
+      if (!Number.isFinite(stepIndex) || stepIndex < 0) continue;
+      if (statusCode !== 1 && statusCode !== 2 && statusCode !== 3) continue;
+      const meta = parseStepMetadata(row["metadata"]);
+      items.push({
+        stepIndex,
+        status: statusCode === 3 ? "completed" : "loading",
+        ...meta,
+      });
+    }
+    return items;
+  } catch {
+    return [];
+  } finally {
+    db?.close();
+  }
+}
+
 export async function readUserStepIndices(
   nativeSessionId: string,
   env: Record<string, string | undefined> = process.env,
@@ -106,7 +347,7 @@ export async function readUserStepIndices(
   }
   let db: DatabaseSync | undefined;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 2000 });
     const rows = db
       .prepare("SELECT idx FROM steps WHERE step_type = 14 ORDER BY idx ASC")
       .all();
@@ -257,14 +498,21 @@ export class SessionRewindTracker {
         throw error;
     }
 
-    let needsRead = false;
+    const targetCheckpoints: FileBackupCheckpoint[] = [];
     for (const cp of this.checkpoints) {
-      if (!cp.files.has(resolved)) {
-        needsRead = true;
-        break;
+      if (cp.files.has(resolved)) continue;
+      if (
+        before === undefined &&
+        cp.token.gitTreeSha &&
+        cp.token.gitTopLevel &&
+        resolved.startsWith(cp.token.gitTopLevel + path.sep) &&
+        !(await this.isGitIgnored(cp.token.gitTopLevel, resolved))
+      ) {
+        continue;
       }
+      targetCheckpoints.push(cp);
     }
-    if (!needsRead) return;
+    if (targetCheckpoints.length === 0) return;
 
     let content: Buffer | null = null;
     try {
@@ -279,8 +527,7 @@ export class SessionRewindTracker {
             : Buffer.from(before);
       if (content && content.length > 10 * 1024 * 1024)
         throw new Error("File backup limit exceeded");
-      for (const cp of this.checkpoints)
-        if (!cp.files.has(resolved)) cp.modes.set(resolved, info.mode);
+      for (const cp of targetCheckpoints) cp.modes.set(resolved, info.mode);
     } catch (error) {
       if (
         !error ||
@@ -288,7 +535,7 @@ export class SessionRewindTracker {
         !("code" in error) ||
         error.code !== "ENOENT"
       ) {
-        for (const cp of this.checkpoints) {
+        for (const cp of targetCheckpoints) {
           cp.invalidReason = "File backup unavailable: " + resolved;
           await this.saveCheckpoint(cp);
         }
@@ -299,17 +546,31 @@ export class SessionRewindTracker {
     if (before !== undefined)
       content = before === null ? null : Buffer.from(before);
     if (content && content.length > 10 * 1024 * 1024) {
-      for (const checkpoint of this.checkpoints) {
+      for (const checkpoint of targetCheckpoints) {
         checkpoint.invalidReason = "File backup limit exceeded: " + resolved;
         await this.saveCheckpoint(checkpoint);
       }
       return;
     }
-    for (const cp of this.checkpoints) {
-      if (!cp.files.has(resolved)) {
-        cp.files.set(resolved, content);
-        await this.saveCheckpoint(cp);
-      }
+    for (const cp of targetCheckpoints) {
+      cp.files.set(resolved, content);
+      await this.saveCheckpoint(cp);
+    }
+  }
+
+  private async isGitIgnored(
+    topLevel: string,
+    resolvedPath: string,
+  ): Promise<boolean> {
+    try {
+      await execCommand(
+        "git",
+        ["check-ignore", "-q", "--", path.relative(topLevel, resolvedPath)],
+        { cwd: topLevel, env: this.env, timeout: 2000 },
+      );
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -519,9 +780,24 @@ export class SessionRewindTracker {
         this.checkpoints.splice(index, 1);
   }
 
+  async revertAttemptConversation(
+    nativeSessionId: string,
+    token: RevertToken,
+  ): Promise<void> {
+    await this.truncateConversation(nativeSessionId, token, true);
+  }
+
   async revertConversation(
     nativeSessionId: string,
     token: RevertToken,
+  ): Promise<void> {
+    await this.truncateConversation(nativeSessionId, token, false);
+  }
+
+  private async truncateConversation(
+    nativeSessionId: string,
+    token: RevertToken,
+    allowMissingUserTurn: boolean,
   ): Promise<void> {
     const dbPath = resolveConversationDbPath(nativeSessionId, this.env);
     if (token.conversationId !== nativeSessionId)
@@ -536,9 +812,10 @@ export class SessionRewindTracker {
       );
 
     let cutStepIndex = token.stepIndex;
+    let shouldDeleteDbRows = false;
     let db: DatabaseSync | undefined;
     try {
-      db = new DatabaseSync(dbPath);
+      db = new DatabaseSync(dbPath, { timeout: 2000 });
       const userRows = db
         .prepare("SELECT idx FROM steps WHERE step_type = 14 ORDER BY idx ASC")
         .all();
@@ -546,37 +823,49 @@ export class SessionRewindTracker {
         .map((row) => Number(row["idx"]))
         .filter((idx) => Number.isFinite(idx) && idx >= 0);
 
-      if (token.turnIndex >= userIndices.length)
+      if (token.turnIndex < userIndices.length) {
+        cutStepIndex = userIndices[token.turnIndex]!;
+        shouldDeleteDbRows = true;
+      } else if (!allowMissingUserTurn) {
         throw new AntigravityError(
           "Rewind target is not a user turn in this conversation",
           "INVALID_REVERT_TOKEN",
         );
-      cutStepIndex = userIndices[token.turnIndex]!;
+      } else {
+        const maxRow = db.prepare("SELECT MAX(idx) AS maxIdx FROM steps").get();
+        const maxIdx =
+          maxRow?.["maxIdx"] === null || maxRow?.["maxIdx"] === undefined
+            ? -1
+            : Number(maxRow["maxIdx"]);
+        shouldDeleteDbRows = Number.isFinite(maxIdx) && maxIdx >= cutStepIndex;
+      }
 
-      const backupDir = path.join(
-        resolveAntigravityCliDir(this.env),
-        "paseo-rewind",
-        nativeSessionId,
-      );
-      await mkdir(backupDir, { recursive: true, mode: 0o700 });
-      db.prepare("VACUUM INTO ?").run(
-        path.join(backupDir, "conversation-" + randomUUID() + ".db"),
-      );
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        for (const table of [
-          "steps",
-          "gen_metadata",
-          "executor_metadata",
-          "parent_references",
-          "battle_mode_infos",
-        ]) {
-          db.prepare(`DELETE FROM ${table} WHERE idx >= ?`).run(cutStepIndex);
+      if (shouldDeleteDbRows) {
+        const backupDir = path.join(
+          resolveAntigravityCliDir(this.env),
+          "paseo-rewind",
+          nativeSessionId,
+        );
+        await mkdir(backupDir, { recursive: true, mode: 0o700 });
+        db.prepare("VACUUM INTO ?").run(
+          path.join(backupDir, "conversation-" + randomUUID() + ".db"),
+        );
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          for (const table of [
+            "steps",
+            "gen_metadata",
+            "executor_metadata",
+            "parent_references",
+            "battle_mode_infos",
+          ]) {
+            db.prepare(`DELETE FROM ${table} WHERE idx >= ?`).run(cutStepIndex);
+          }
+          db.exec("COMMIT");
+        } catch (innerError) {
+          db.exec("ROLLBACK");
+          throw innerError;
         }
-        db.exec("COMMIT");
-      } catch (innerError) {
-        db.exec("ROLLBACK");
-        throw innerError;
       }
     } finally {
       db?.close();
@@ -644,13 +933,13 @@ export class SessionRewindTracker {
           await copyFile(realIndex, tempIndex);
         }
         const gitEnv = { ...this.env, GIT_INDEX_FILE: tempIndex };
-        const statePath = path.relative(
+        const cliDirRel = path.relative(
           topLevel,
-          path.join(resolveAntigravityCliDir(this.env), "paseo-rewind"),
+          resolveAntigravityCliDir(this.env),
         );
         const addArgs = ["add", "-A", "--", "."];
-        if (!statePath.startsWith("..") && !path.isAbsolute(statePath))
-          addArgs.push(":(exclude)" + statePath);
+        if (!cliDirRel.startsWith("..") && !path.isAbsolute(cliDirRel))
+          addArgs.push(":(exclude)" + cliDirRel);
         await execCommand("git", addArgs, {
           cwd: topLevel,
           env: gitEnv,
@@ -739,11 +1028,8 @@ export class SessionRewindTracker {
       for (const relPath of currentUntracked) {
         if (!allowedSet.has(relPath)) {
           const absPath = path.resolve(topLevel, relPath);
-          const stateDir = path.join(
-            resolveAntigravityCliDir(this.env),
-            "paseo-rewind",
-          );
-          if (absPath === stateDir || absPath.startsWith(stateDir + path.sep))
+          const cliDir = resolveAntigravityCliDir(this.env);
+          if (absPath === cliDir || absPath.startsWith(cliDir + path.sep))
             continue;
           if (absPath.startsWith(topLevel + path.sep)) {
             await assertSafeParent(absPath);

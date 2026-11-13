@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import {
   readConversationRecords,
+  readConversationRecordsFromOffset,
   parseSubagentResult,
   matchesToolResult,
+  type TranscriptOffset,
   type TranscriptRecord,
 } from "./transcript-history.js";
 
@@ -240,4 +242,97 @@ export async function readBackgroundTurn(
       [...tasks.values()].every((task) => task.daemon || task.completed) &&
       (continuationStarted || [...tasks.values()].every((task) => task.daemon)),
   };
+}
+
+export interface TurnExecutionInspection {
+  failed: boolean;
+  message?: string;
+  details?: unknown;
+}
+
+export async function inspectTurnExecutionFailure(
+  conversationId: string,
+  env: Record<string, string>,
+  before: TranscriptOffset | null,
+  sawInbandError: boolean,
+): Promise<TurnExecutionInspection> {
+  const { hasTranscript, records } = await readConversationRecordsFromOffset(
+    conversationId,
+    env,
+    before,
+  );
+  if (!hasTranscript) {
+    return sawInbandError
+      ? { failed: true, message: "Agent execution terminated due to error." }
+      : { failed: false };
+  }
+  let hasBackgroundTasks = false;
+  let plannerDone = false;
+  let failure: BackgroundFailure | undefined;
+  for (const record of records) {
+    if (record.type === "USER_INPUT") {
+      plannerDone = false;
+      failure = undefined;
+      hasBackgroundTasks = false;
+    }
+    if (record.type === "PLANNER_RESPONSE") {
+      plannerDone = record.status === "DONE" && !record.tool_calls?.length;
+    } else if (
+      record.type !== "CHECKPOINT" &&
+      record.type !== "CONVERSATION_HISTORY"
+    ) {
+      plannerDone = false;
+    }
+    const text = record.content ?? "";
+    if (
+      record.type === "GENERIC" &&
+      record.status === "RUNNING" &&
+      /Tool is running as a background task with task id:\s*([\w-]+\/task-\d+)/.test(
+        text,
+      )
+    ) {
+      hasBackgroundTasks = true;
+    }
+    if (
+      record.type === "GENERIC" &&
+      record.status === "DONE" &&
+      parseSubagentResult(text)
+    ) {
+      hasBackgroundTasks = true;
+    }
+    const executionRecord = [
+      "PLANNER_RESPONSE",
+      "SYSTEM_MESSAGE",
+      "EXECUTION_ERROR",
+      "ERROR",
+    ].includes(record.type ?? "");
+    if (
+      executionRecord &&
+      (record.status === "ERROR" ||
+        record.status === "FAILED" ||
+        record.type === "EXECUTION_ERROR")
+    ) {
+      failure = {
+        message: text.trim() || "Agent execution terminated due to error.",
+        details: record.error_details,
+      };
+    }
+  }
+  if (hasBackgroundTasks && !sawInbandError) {
+    return { failed: false };
+  }
+  if (failure) {
+    return {
+      failed: true,
+      message: failure.message,
+      details: failure.details,
+    };
+  }
+  if (sawInbandError && !plannerDone) {
+    return {
+      failed: true,
+      message: "Agent execution terminated due to error.",
+    };
+  }
+  return { failed: false };
 }

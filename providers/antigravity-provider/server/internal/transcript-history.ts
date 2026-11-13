@@ -5,7 +5,11 @@ import readline from "node:readline";
 import { z } from "zod";
 import type { ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
-import { resolveTranscriptDir } from "./rewind.js";
+import {
+  readCompactionSteps,
+  resolveTranscriptDir,
+  type CompactionStepInfo,
+} from "./rewind.js";
 import { acpToolToTimelineItem, type AcpToolCallState } from "./timeline.js";
 
 const childSchema = z.object({
@@ -85,6 +89,68 @@ export async function readTranscriptSummary(
   return summary;
 }
 
+export interface TranscriptCompactionStep extends CompactionStepInfo {
+  trigger: "auto" | "manual";
+}
+
+export async function readTranscriptCompactionSteps(
+  conversationId: string,
+  env: Record<string, string | undefined> = process.env,
+  minStepIndex = 0,
+): Promise<TranscriptCompactionStep[]> {
+  const dbSteps = readCompactionSteps(conversationId, env, minStepIndex);
+  const byStep = new Map<number, TranscriptCompactionStep>(
+    dbSteps.map((step) => [step.stepIndex, { ...step, trigger: "auto" }]),
+  );
+  const file = await resolveTranscriptFile(conversationId, env);
+  if (file) {
+    let lastUserWasCompact = false;
+    let syntheticIndex = 0;
+    for await (const record of readTranscriptRecords(file.path)) {
+      const stepIndex = record.step_index ?? syntheticIndex++;
+      const type = record.type ?? "";
+      if (type === "USER_INPUT") {
+        const text = displayUserText(record.content ?? "");
+        lastUserWasCompact = /^\/compact(?:\s|$)/i.test(text.trim());
+        continue;
+      }
+      if (type !== "CHECKPOINT" || stepIndex < minStepIndex) continue;
+      if (
+        record.status === "ERROR" ||
+        record.status === "FAILED" ||
+        record.status === "CANCELED"
+      )
+        continue;
+      const timestamp =
+        record.created_at && Number.isFinite(Date.parse(record.created_at))
+          ? new Date(record.created_at).toISOString()
+          : undefined;
+      const existing = byStep.get(stepIndex);
+      const running =
+        record.status === "RUNNING" || record.status === "PENDING";
+      byStep.set(stepIndex, {
+        stepIndex,
+        status:
+          existing?.status === "completed"
+            ? "completed"
+            : running
+              ? "loading"
+              : (existing?.status ?? "completed"),
+        trigger: lastUserWasCompact ? "manual" : (existing?.trigger ?? "auto"),
+        ...(existing?.preTokens !== undefined
+          ? { preTokens: existing.preTokens }
+          : {}),
+        ...(timestamp || existing?.timestamp
+          ? { timestamp: timestamp ?? existing?.timestamp }
+          : {}),
+      });
+    }
+  }
+  return [...byStep.values()].sort(
+    (left, right) => left.stepIndex - right.stepIndex,
+  );
+}
+
 export async function readTranscriptTimeline(
   conversationId: string,
   env: Record<string, string | undefined> = process.env,
@@ -92,9 +158,16 @@ export async function readTranscriptTimeline(
 ): Promise<TranscriptTimelineItem[]> {
   const file = await resolveTranscriptFile(conversationId, env);
   if (!file) return [];
+  const compactionByStep = new Map(
+    readCompactionSteps(conversationId, env).map((step) => [
+      step.stepIndex,
+      step,
+    ]),
+  );
   const items: TranscriptTimelineItem[] = [];
   const pending: PendingTool[] = [];
   const backgroundTools = new Map<string, PendingTool>();
+  let lastUserWasCompact = false;
   for await (const record of readTranscriptRecords(file.path)) {
     const stepIndex = record.step_index ?? items.length;
     const timestamp =
@@ -107,6 +180,7 @@ export async function readTranscriptTimeline(
     if (type === "USER_INPUT") {
       backgroundTools.clear();
       const text = displayUserText(record.content ?? "");
+      lastUserWasCompact = /^\/compact(?:\s|$)/i.test(text.trim());
       if (!text) continue;
       const id = "history:" + stepIndex + ":user";
       items.push({
@@ -115,6 +189,28 @@ export async function readTranscriptTimeline(
         messageId: id,
         text: boundText(text),
         timestamp,
+      });
+      continue;
+    }
+    if (type === "CHECKPOINT") {
+      if (
+        record.status === "ERROR" ||
+        record.status === "FAILED" ||
+        record.status === "CANCELED"
+      )
+        continue;
+      const running =
+        record.status === "RUNNING" || record.status === "PENDING";
+      const dbStep = compactionByStep.get(stepIndex);
+      items.push({
+        type: "compaction",
+        id: "history:" + stepIndex + ":compaction",
+        status: live && running ? "loading" : "completed",
+        trigger: lastUserWasCompact ? "manual" : "auto",
+        ...(dbStep?.preTokens !== undefined
+          ? { preTokens: dbStep.preTokens }
+          : {}),
+        timestamp: timestamp ?? dbStep?.timestamp,
       });
       continue;
     }
@@ -241,6 +337,57 @@ async function resolveTranscriptFile(
   return null;
 }
 
+export interface TranscriptOffset {
+  path: string;
+  size: number;
+}
+
+export async function statTranscriptOffset(
+  conversationId: string,
+  env: Record<string, string | undefined>,
+): Promise<TranscriptOffset | null> {
+  const logsDir = resolveTranscriptDir(conversationId, env);
+  for (const name of ["transcript_full.jsonl", "transcript.jsonl"]) {
+    const filePath = path.join(logsDir, name);
+    try {
+      const info = await stat(filePath);
+      if (info.isFile()) return { path: filePath, size: info.size };
+    } catch (error) {
+      if (
+        !error ||
+        typeof error !== "object" ||
+        !("code" in error) ||
+        error.code !== "ENOENT"
+      )
+        throw error;
+    }
+  }
+  return null;
+}
+
+export async function readConversationRecordsFromOffset(
+  conversationId: string,
+  env: Record<string, string>,
+  before: TranscriptOffset | null,
+): Promise<{ hasTranscript: boolean; records: TranscriptRecord[] }> {
+  const current = await statTranscriptOffset(conversationId, env);
+  if (!current || current.size === 0) {
+    return { hasTranscript: Boolean(current), records: [] };
+  }
+  const start =
+    before && before.path === current.path && before.size <= current.size
+      ? before.size
+      : 0;
+  if (start >= current.size) {
+    return { hasTranscript: true, records: [] };
+  }
+  const records: TranscriptRecord[] = [];
+  for await (const record of readTranscriptRecords(current.path, start)) {
+    records.push(record);
+  }
+  return { hasTranscript: true, records };
+}
+
 export async function* readConversationRecords(
   conversationId: string,
   env: Record<string, string>,
@@ -249,8 +396,11 @@ export async function* readConversationRecords(
   if (file) yield* readTranscriptRecords(file.path);
 }
 
-async function* readTranscriptRecords(filePath: string) {
-  const stream = createReadStream(filePath, { encoding: "utf8" });
+async function* readTranscriptRecords(filePath: string, start = 0) {
+  const stream = createReadStream(filePath, {
+    encoding: "utf8",
+    ...(start > 0 ? { start } : {}),
+  });
   const lines = readline.createInterface({
     input: stream,
     crlfDelay: Infinity,

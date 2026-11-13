@@ -15,8 +15,34 @@ import { afterEach, describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import {
   SessionRewindTracker,
+  readCompactionSteps,
+  readConversationTurnError,
   resolveConversationDbPath,
 } from "../providers/antigravity-provider/server/internal/rewind.js";
+
+function encodeVarint(value: number): Buffer {
+  const bytes: number[] = [];
+  let remaining = BigInt(value);
+  while (remaining >= 0x80n) {
+    bytes.push(Number((remaining & 0x7fn) | 0x80n));
+    remaining >>= 7n;
+  }
+  bytes.push(Number(remaining));
+  return Buffer.from(bytes);
+}
+
+function encodeVarintField(field: number, value: number): Buffer {
+  return Buffer.concat([encodeVarint(field << 3), encodeVarint(value)]);
+}
+
+function encodeBytesField(field: number, payload: Buffer | string): Buffer {
+  const buf = typeof payload === "string" ? Buffer.from(payload) : payload;
+  return Buffer.concat([
+    encodeVarint((field << 3) | 2),
+    encodeVarint(buf.length),
+    buf,
+  ]);
+}
 
 const directories: string[] = [];
 async function workspace() {
@@ -169,5 +195,99 @@ describe("file rewind", () => {
     await expect(tracker.revertConversation("other", token)).rejects.toThrow(
       /conversation/i,
     );
+  });
+
+  it("extracts terminal step_type 17 errors while ignoring internal retry hints and recovered turns", async () => {
+    const { env } = await workspace();
+    const dbPath = resolveConversationDbPath("fixture", env);
+    await mkdir(path.dirname(dbPath), { recursive: true });
+    const internalHint = encodeBytesField(
+      24,
+      Buffer.concat([
+        encodeBytesField(
+          3,
+          encodeBytesField(
+            2,
+            "The stream was interrupted. Please continue the task you were working on.",
+          ),
+        ),
+        encodeVarintField(4, 1),
+      ]),
+    );
+    const terminalProxyError = encodeBytesField(
+      24,
+      Buffer.concat([
+        encodeBytesField(
+          3,
+          Buffer.concat([
+            encodeBytesField(1, "Agent execution terminated due to error."),
+            encodeBytesField(
+              2,
+              "FAILED_PRECONDITION (code 400): User location is not supported for the API use.",
+            ),
+            encodeVarintField(7, 400),
+          ]),
+        ),
+        encodeVarintField(5, 1),
+      ]),
+    );
+    const db = new DatabaseSync(dbPath);
+    db.exec(
+      "CREATE TABLE steps (idx INTEGER, step_type INTEGER, status INTEGER, step_payload BLOB)",
+    );
+    const insert = db.prepare("INSERT INTO steps VALUES (?, ?, ?, ?)");
+    insert.run(0, 14, 3, Buffer.alloc(0));
+    insert.run(1, 17, 3, internalHint);
+    expect(readConversationTurnError("fixture", 0, env)).toBeNull();
+    insert.run(2, 17, 3, terminalProxyError);
+    expect(readConversationTurnError("fixture", 0, env)).toEqual({
+      stepIndex: 2,
+      userMessage: "Agent execution terminated due to error.",
+      shortError:
+        "FAILED_PRECONDITION (code 400): User location is not supported for the API use.",
+      httpStatus: 400,
+    });
+    insert.run(3, 15, 3, Buffer.alloc(0));
+    expect(readConversationTurnError("fixture", 0, env)).toBeNull();
+    db.close();
+  });
+
+  it("decodes compaction step_type 23 status, timestamp and preTokens from SQLite metadata", async () => {
+    const { env } = await workspace();
+    const dbPath = resolveConversationDbPath("fixture", env);
+    await mkdir(path.dirname(dbPath), { recursive: true });
+    const metadata = Buffer.concat([
+      encodeBytesField(
+        1,
+        Buffer.concat([
+          encodeVarintField(1, 1_760_000_000),
+          encodeVarintField(2, 500_000_000),
+        ]),
+      ),
+      encodeBytesField(
+        9,
+        Buffer.concat([
+          encodeVarintField(2, 32_000),
+          encodeVarintField(5, 210_500),
+        ]),
+      ),
+    ]);
+    const db = new DatabaseSync(dbPath);
+    db.exec(
+      "CREATE TABLE steps (idx INTEGER, step_type INTEGER, status INTEGER, metadata BLOB)",
+    );
+    const insert = db.prepare("INSERT INTO steps VALUES (?, ?, ?, ?)");
+    insert.run(4, 23, 2, Buffer.alloc(0));
+    insert.run(9, 23, 3, metadata);
+    db.close();
+    expect(readCompactionSteps("fixture", env)).toEqual([
+      { stepIndex: 4, status: "loading" },
+      {
+        stepIndex: 9,
+        status: "completed",
+        preTokens: 242_500,
+        timestamp: new Date(1_760_000_000_500).toISOString(),
+      },
+    ]);
   });
 });

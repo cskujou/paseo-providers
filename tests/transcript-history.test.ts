@@ -233,4 +233,49 @@ describe("local transcript metadata and replay", () => {
       /conversation ID/,
     );
   });
+
+  it("maps CHECKPOINT records to auto and manual compaction timeline items", async () => {
+    const { env } = await transcript([
+      { step_index: 0, type: "USER_INPUT", content: "long task" },
+      { step_index: 1, type: "PLANNER_RESPONSE", content: "working" },
+      {
+        step_index: 2,
+        type: "CHECKPOINT",
+        status: "DONE",
+        created_at: "2026-11-13T00:00:00Z",
+        content: "# Resuming from a compaction",
+      },
+      { step_index: 3, type: "USER_INPUT", content: "/compact" },
+      {
+        step_index: 4,
+        type: "CHECKPOINT",
+        status: "RUNNING",
+        created_at: "2026-11-13T00:01:00Z",
+      },
+    ]);
+    const liveItems = await readTranscriptTimeline("fixture", env, true);
+    const compactions = liveItems.filter((item) => item.type === "compaction");
+    expect(compactions).toEqual([
+      {
+        type: "compaction",
+        id: "history:2:compaction",
+        status: "completed",
+        trigger: "auto",
+        timestamp: "2026-11-13T00:00:00.000Z",
+      },
+      {
+        type: "compaction",
+        id: "history:4:compaction",
+        status: "loading",
+        trigger: "manual",
+        timestamp: "2026-11-13T00:01:00.000Z",
+      },
+    ]);
+    const replayItems = await readTranscriptTimeline("fixture", env, false);
+    expect(
+      replayItems
+        .filter((item) => item.type === "compaction")
+        .map((item) => item.status),
+    ).toEqual(["completed", "completed"]);
+  });
 });

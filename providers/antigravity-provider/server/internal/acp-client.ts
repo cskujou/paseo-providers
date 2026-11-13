@@ -63,6 +63,7 @@ export interface AcpClientOptions {
   launch: ProviderLaunch;
   cwd?: string;
   env?: Record<string, string>;
+  skipPermissions?: boolean;
   startupTimeoutMs?: number;
   onSessionUpdate?(params: AcpSessionUpdateParams): void | Promise<void>;
   onPermissionRequest?(
@@ -81,18 +82,26 @@ export class AcpClient {
   private closePromise: Promise<void> | null = null;
   private updateTail: Promise<void> = Promise.resolve();
   private readonly exited: Promise<void>;
+  public readonly skipPermissions: boolean;
   public agentCapabilities: Record<string, unknown> = {};
   public agentVersion = "";
 
   constructor(private readonly options: AcpClientOptions) {
     const { launch, cwd, env } = options;
-    this.child = spawnProcess(launch.command, [...launch.args, "acp"], {
+    this.skipPermissions = Boolean(options.skipPermissions);
+    const acpArgs = this.skipPermissions
+      ? [...launch.args, "acp", "--dangerously-skip-permissions"]
+      : [...launch.args, "acp"];
+    this.child = spawnProcess(launch.command, acpArgs, {
       env: { ...launch.env, ...env },
       cwd,
       stdio: "pipe",
       detached: process.platform !== "win32",
     });
-    logDiagnostic("acp.spawn", { pid: this.child.pid });
+    logDiagnostic("acp.spawn", {
+      pid: this.child.pid,
+      skipPermissions: this.skipPermissions,
+    });
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", (chunk: string) => {
       this.stderr = (this.stderr + chunk).slice(-8192);

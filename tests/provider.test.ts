@@ -1,5 +1,6 @@
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
@@ -1715,5 +1716,356 @@ describe("Antigravity provider public contract", () => {
     expect(
       catalog.models[0]?.thinkingOptions?.map((option) => option.id),
     ).toEqual(["medium", "high"]);
+  });
+
+  it("passes --dangerously-skip-permissions in full-access mode and restarts when toggling", async () => {
+    const h = await harness();
+    await h.open({
+      config: {
+        cwd: h.cwd,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: false,
+        mode: "full-access",
+      },
+    });
+    await h.connection.send({
+      type: "session.configure",
+      requestId: "to-default",
+      sessionId: "s",
+      changes: { mode: "default" },
+    });
+    await h.wait(
+      "request.completed",
+      (event) => event.requestId === "to-default",
+    );
+    await h.connection.send({
+      type: "session.configure",
+      requestId: "to-full",
+      sessionId: "s",
+      changes: { mode: "full-access" },
+    });
+    await h.wait("request.completed", (event) => event.requestId === "to-full");
+    const argsLines = (
+      await readFile(path.join(h.cwd, "fixture-args.txt"), "utf8")
+    )
+      .trim()
+      .split("\n");
+    expect(argsLines).toEqual([
+      "acp --dangerously-skip-permissions",
+      "acp",
+      "acp --dangerously-skip-permissions",
+    ]);
+  });
+
+  it("retries on a fresh ACP process when agy emits an in-band execution error before any tool call", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("retry-inband", "inband-error-once");
+    await h.wait("session.turn", (event) => event.state === "completed");
+    const assistantMessages = h.events
+      .filter((event) => event.type === "timeline.item")
+      .filter((event) => event.item.type === "assistant_message")
+      .map((event) =>
+        event.item.type === "assistant_message" ? event.item.text : "",
+      );
+    expect(assistantMessages).toEqual(["RECOVERED_OK"]);
+    expect(
+      (await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8"))
+        .trim()
+        .split("\n"),
+    ).toHaveLength(2);
+  });
+
+  it("fails the turn instead of marking it completed when agy repeatedly emits in-band execution errors", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("fail-inband", "inband-error-always");
+    const failed = await h.wait(
+      "session.turn",
+      (event) => event.state === "failed",
+    );
+    expect(failed.error).toMatchObject({
+      code: "AGENT_EXECUTION_ERROR",
+      message: "Agent execution terminated due to error.",
+    });
+    const assistantMessages = h.events
+      .filter((event) => event.type === "timeline.item")
+      .filter((event) => event.item.type === "assistant_message");
+    expect(assistantMessages).toHaveLength(0);
+    expect(
+      (await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8"))
+        .trim()
+        .split("\n"),
+    ).toHaveLength(3);
+  });
+
+  it("preserves a completed turn when the assistant genuinely outputs the execution error string", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("literal-inband", "inband-error-literal-reply");
+    await h.wait("session.turn", (event) => event.state === "completed");
+    const assistantMessages = h.events
+      .filter((event) => event.type === "timeline.item")
+      .filter((event) => event.item.type === "assistant_message")
+      .map((event) =>
+        event.item.type === "assistant_message" ? event.item.text : "",
+      );
+    expect(assistantMessages).toEqual([
+      "⚠ Agent execution terminated due to error.",
+    ]);
+    expect(
+      (await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8"))
+        .trim()
+        .split("\n"),
+    ).toHaveLength(1);
+  });
+
+  it("automatically rewinds SQLite history, recycles ACP, and retries transient silent errors", async () => {
+    const h = await harness({
+      FIXTURE_DB: "1",
+      PASEO_AGY_AUTO_RETRY_DELAY_MS: "10",
+    });
+    await h.open();
+    await h.prompt("m1", "transient-silent-error");
+    await h.wait("session.turn", (event) => event.state === "completed");
+
+    const assistantTexts = h.events
+      .filter((event) => event.type === "timeline.item")
+      .flatMap((event) =>
+        event.item.type === "assistant_message" ? [event.item.text] : [],
+      );
+    expect(assistantTexts).not.toContain(
+      "Agent execution terminated due to error.",
+    );
+    expect(assistantTexts.at(-1)).toBe("RECOVERED_AFTER_REWIND(stepsBefore=0)");
+
+    const turns = h.events
+      .filter((event) => event.type === "session.turn")
+      .map((event) => event.state);
+    expect(turns).toEqual(["started", "completed"]);
+
+    const retryNotices = h.events
+      .filter((event) => event.type === "session.notice")
+      .filter((event) => event.notice.id.startsWith("auto-retry:"));
+    expect(retryNotices.some((event) => !event.notice.dismissed)).toBe(true);
+    expect(retryNotices.at(-1)?.notice.dismissed).toBe(true);
+
+    const pids = (
+      await readFile(path.join(h.cwd, "fixture-processes.txt"), "utf8")
+    )
+      .trim()
+      .split("\n");
+    expect(pids).toHaveLength(2);
+    expect(pids[0]).not.toBe(pids[1]);
+  });
+
+  it("reverts tracked file modifications before retrying a failed transient turn", async () => {
+    const h = await harness({
+      FIXTURE_DB: "1",
+      PASEO_AGY_AUTO_RETRY_DELAY_MS: "10",
+    });
+    execFileSync("git", ["init", "-q"], { cwd: h.cwd });
+    await writeFile(
+      path.join(h.cwd, ".git", "info", "exclude"),
+      "retry-attempts.txt\n",
+    );
+    const target = path.join(h.cwd, "edited.txt");
+    await writeFile(target, "clean-before");
+    execFileSync("git", ["add", "edited.txt"], { cwd: h.cwd });
+
+    await h.open();
+    await h.prompt("m1", "edit-then-silent-error");
+    await h.wait("session.turn", (event) => event.state === "completed");
+
+    const assistantTexts = h.events
+      .filter((event) => event.type === "timeline.item")
+      .flatMap((event) =>
+        event.item.type === "assistant_message" ? [event.item.text] : [],
+      );
+    expect(assistantTexts.at(-1)).toBe(
+      "RECOVERED_AFTER_REWIND(stepsBefore=0:clean-before)",
+    );
+    expect(await readFile(target, "utf8")).toBe("clean-before");
+  });
+
+  it("does not auto-retry non-transient errors or turns after shell side effects", async () => {
+    for (const [promptText, expectedDetail] of [
+      ["nonretryable-silent-error", "credits balance is too low"],
+      ["shell-then-silent-error", "User location is not supported"],
+    ] as const) {
+      const h = await harness({
+        FIXTURE_DB: "1",
+        PASEO_AGY_AUTO_RETRY_DELAY_MS: "10",
+      });
+      await h.open();
+      await h.prompt("m1", promptText);
+      const failed = await h.wait(
+        "session.turn",
+        (event) => event.state === "failed",
+      );
+      expect(failed.error?.diagnostic).toContain(expectedDetail);
+      const attempts = (
+        await readFile(path.join(h.cwd, "retry-attempts.txt"), "utf8")
+      )
+        .trim()
+        .split("\n");
+      expect(attempts).toHaveLength(1);
+    }
+  });
+
+  it("emits loading and completed compaction items for manual /compact and auto-compaction turns", async () => {
+    const h = await harness({ FIXTURE_DB: "1" });
+    await h.open();
+
+    await h.prompt("c1", "/compact");
+    await h.wait("session.turn", (event) => event.state === "completed");
+
+    const manualCompactions = h.events
+      .filter((event) => event.type === "timeline.item")
+      .flatMap((event) =>
+        event.item.type === "compaction" ? [event.item] : [],
+      );
+    expect(manualCompactions.map((item) => item.status)).toEqual([
+      "loading",
+      "completed",
+    ]);
+    expect(manualCompactions.at(-1)).toMatchObject({
+      type: "compaction",
+      status: "completed",
+      trigger: "manual",
+      preTokens: 120_000,
+    });
+
+    const beforeAutoCount = h.events.length;
+    await h.connection.send({
+      type: "session.prompt",
+      sessionId: "s",
+      prompt: {
+        clientMessageId: "c2",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [{ type: "text", text: "auto-compact-turn" }],
+        },
+      },
+    });
+    await new Promise<void>((resolve, reject) => {
+      const check = () =>
+        h.events
+          .slice(beforeAutoCount)
+          .some(
+            (event) =>
+              event.type === "session.turn" && event.state === "completed",
+          );
+      if (check()) {
+        resolve();
+        return;
+      }
+      const timer = setInterval(() => {
+        if (check()) {
+          clearInterval(timer);
+          clearTimeout(timeout);
+          resolve();
+        }
+      }, 20);
+      const timeout = setTimeout(() => {
+        clearInterval(timer);
+        reject(new Error("Timed out waiting for second turn"));
+      }, 2000);
+    });
+
+    const autoCompactions = h.events
+      .slice(beforeAutoCount)
+      .filter((event) => event.type === "timeline.item")
+      .flatMap((event) =>
+        event.item.type === "compaction" ? [event.item] : [],
+      );
+    expect(autoCompactions.map((item) => item.status)).toEqual([
+      "loading",
+      "completed",
+    ]);
+    expect(autoCompactions.at(-1)).toMatchObject({
+      type: "compaction",
+      status: "completed",
+      trigger: "auto",
+      preTokens: 245_000,
+    });
+  });
+
+  it("interleaves completed compaction items in chronological order during ACP session/load replay", async () => {
+    const h = await harness({ FIXTURE_LOAD_COMPACT: "1" });
+    const dbDir = path.join(
+      h.cwd,
+      ".gemini",
+      "antigravity-cli",
+      "conversations",
+    );
+    await mkdir(dbDir, { recursive: true });
+    const db = new DatabaseSync(path.join(dbDir, "fixture.db"));
+    db.exec(
+      "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB, step_payload BLOB)",
+    );
+    const varint = (v: number): Buffer => {
+      const out: number[] = [];
+      let n = v;
+      while (n >= 0x80) {
+        out.push((n & 0x7f) | 0x80);
+        n = Math.floor(n / 128);
+      }
+      out.push(n);
+      return Buffer.from(out);
+    };
+    const metaWithTokens = (tokens: number): Buffer => {
+      const usage = Buffer.concat([
+        varint(2 << 3),
+        varint(10_000),
+        varint(5 << 3),
+        varint(tokens - 10_000),
+      ]);
+      return Buffer.concat([varint((9 << 3) | 2), varint(usage.length), usage]);
+    };
+    const insert = db.prepare("INSERT INTO steps VALUES (?, ?, 3, ?, ?)");
+    const empty = Buffer.alloc(0);
+    insert.run(0, 14, empty, empty);
+    insert.run(1, 15, empty, empty);
+    insert.run(2, 23, metaWithTokens(200_000), empty);
+    insert.run(3, 14, empty, empty);
+    insert.run(4, 23, metaWithTokens(45_000), empty);
+    insert.run(5, 15, empty, empty);
+    insert.run(6, 14, empty, empty);
+    insert.run(7, 15, empty, empty);
+    insert.run(8, 23, metaWithTokens(215_000), empty);
+    db.close();
+
+    await h.open({
+      history: "replay",
+      persistence: { version: 1, data: { conversationId: "fixture" } },
+    });
+
+    const summary = h.events
+      .filter((event) => event.type === "timeline.item")
+      .map((event) => {
+        const item = event.item;
+        if (item.type === "user_message" || item.type === "assistant_message") {
+          return `${item.type}:${item.text}`;
+        }
+        if (item.type === "compaction") {
+          return `compaction:${item.trigger}:${item.preTokens}`;
+        }
+        return item.type;
+      });
+    expect(summary).toEqual([
+      "user_message:u1",
+      "assistant_message:a1",
+      "compaction:auto:200000",
+      "user_message:/compact",
+      "compaction:manual:45000",
+      "assistant_message:compacted reply",
+      "user_message:u3",
+      "assistant_message:a3",
+      "compaction:auto:215000",
+    ]);
   });
 });

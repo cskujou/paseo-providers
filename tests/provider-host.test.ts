@@ -159,6 +159,48 @@ describe("compiled provider through the real Paseo host", () => {
       parentFinalText: "PARENT_DONE",
     });
   }, 20000);
+  it("auto-rewinds transient execution errors and forwards compaction timeline events through the host", async () => {
+    expect(await run("retry-and-compaction")).toEqual({
+      retryFinalText: "RECOVERED_AFTER_REWIND(stepsBefore=0)",
+      autoFinalText: "Auto compact turn complete.",
+      manualFinalText: "Manual compact complete.",
+      assistantLeakedError: false,
+      turns: [
+        "turn_started",
+        "turn_completed",
+        "turn_started",
+        "turn_completed",
+        "turn_started",
+        "turn_completed",
+      ],
+      liveCompactions: [
+        { status: "loading", trigger: "auto", preTokens: null },
+        { status: "completed", trigger: "auto", preTokens: 245_000 },
+        { status: "loading", trigger: "manual", preTokens: null },
+        { status: "completed", trigger: "manual", preTokens: 120_000 },
+      ],
+      importedTimeline: [
+        { type: "user_message", text: "long task" },
+        { type: "compaction", status: "completed", trigger: "auto" },
+        { type: "assistant_message", text: "done" },
+      ],
+    });
+  }, 20000);
+  it("compiles the client bundle and renders Antigravity thinking expanded inline while keeping other providers collapsed", async () => {
+    expect(await run("inline-thinking")).toEqual({
+      queryItemType: "reasoning",
+      emptySkipped: true,
+      kind: "antigravity-inline-thinking",
+      agyRootExpanded: true,
+      agyRootText: "Checking build graph...",
+      agyRootPhase: "streaming",
+      agyRootAfterCollapse: false,
+      agyChildExpanded: true,
+      agyArchivedExpanded: true,
+      codexDefaultExpanded: false,
+      codexAfterExpand: true,
+    });
+  }, 20000);
   it("keeps description-only previews working for other plugin providers", async () => {
     expect(await run("legacy")).toEqual([
       { firstPromptPreview: null, lastPromptPreview: "old-style preview" },

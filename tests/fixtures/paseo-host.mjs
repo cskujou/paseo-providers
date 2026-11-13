@@ -61,6 +61,7 @@ try {
   const logger = { warn() {} };
   registry = new PluginAgentClientRegistry(logger);
   registry.replace([registration]);
+  const mode = process.argv[2];
   const client = registry.definitions().antigravity.createClient(logger, {
     command: {
       mode: "replace",
@@ -69,10 +70,15 @@ try {
     env: {
       HOME: temporary,
       FIXTURE_EMPTY_LOAD: "1",
-      FIXTURE_REJECT_PLAN: process.argv[2] === "plan-approval" ? "0" : "1",
+      FIXTURE_REJECT_PLAN: mode === "plan-approval" ? "0" : "1",
+      ...(mode === "retry-and-compaction"
+        ? {
+            FIXTURE_DB: "1",
+            PASEO_AGY_AUTO_RETRY_DELAY_MS: "10",
+          }
+        : {}),
     },
   });
-  const mode = process.argv[2];
   if (mode === "summaries") {
     const logs = path.join(
       temporary,
@@ -437,6 +443,280 @@ try {
     );
     unsubscribe();
     await session.close();
+  } else if (mode === "retry-and-compaction") {
+    const session = await client.createSession(
+      { provider: "antigravity", cwd: temporary, mcpServers: {} },
+      undefined,
+      { persistSession: true },
+    );
+    const events = [];
+    const unsubscribe = session.subscribe((event) => events.push(event));
+    const retryResult = await session.run("transient-silent-error");
+    const autoResult = await session.run("auto-compact-turn");
+    const manualResult = await session.run("/compact");
+    unsubscribe();
+    await session.close();
+
+    const importLogs = path.join(
+      temporary,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "matching",
+      ".system_generated",
+      "logs",
+    );
+    await mkdir(importLogs, { recursive: true });
+    await writeFile(
+      path.join(importLogs, "transcript_full.jsonl"),
+      [
+        { step_index: 0, type: "USER_INPUT", content: "long task" },
+        { step_index: 1, type: "CHECKPOINT", status: "DONE" },
+        { step_index: 2, type: "PLANNER_RESPONSE", content: "done" },
+      ]
+        .map((row, index) =>
+          JSON.stringify({
+            ...row,
+            created_at: new Date(
+              Date.UTC(2026, 0, 2, 0, 0, index),
+            ).toISOString(),
+          }),
+        )
+        .join("\n"),
+    );
+    const listed = await client.listImportableSessions({
+      query: "long task",
+      limit: 1,
+    });
+    const importCandidate = listed[0];
+    if (!importCandidate) {
+      throw new Error("Host did not list compact-import transcript");
+    }
+    const imported = await client.importSession(
+      { providerHandleId: importCandidate.providerHandleId, cwd: temporary },
+      {
+        config: { provider: "antigravity", cwd: temporary, mcpServers: {} },
+        storedConfig: { provider: "antigravity", cwd: temporary },
+      },
+    );
+    await imported.session.close();
+
+    const assistantLeakedError = events.some(
+      (event) =>
+        event.type === "timeline" &&
+        event.item.type === "assistant_message" &&
+        event.item.text.includes("Agent execution terminated due to error."),
+    );
+    const liveCompactions = events
+      .filter(
+        (event) =>
+          event.type === "timeline" && event.item.type === "compaction",
+      )
+      .map((event) => ({
+        status: event.item.status,
+        trigger: event.item.trigger,
+        preTokens: event.item.preTokens ?? null,
+      }));
+    console.log(
+      JSON.stringify({
+        retryFinalText: retryResult.finalText,
+        autoFinalText: autoResult.finalText,
+        manualFinalText: manualResult.finalText,
+        assistantLeakedError,
+        turns: events
+          .filter((event) => event.type.startsWith("turn_"))
+          .map((event) => event.type),
+        liveCompactions,
+        importedTimeline: imported.timeline.map((entry) =>
+          entry.item.type === "compaction"
+            ? {
+                type: entry.item.type,
+                status: entry.item.status,
+                trigger: entry.item.trigger,
+              }
+            : { type: entry.item.type, text: entry.item.text },
+        ),
+      }),
+    );
+  } else if (mode === "inline-thinking") {
+    if (typeof compiled.clientBundle !== "string" || !compiled.clientBundle) {
+      throw new Error("Expected compileDirectoryPlugin to emit clientBundle");
+    }
+    let stateSlot = null;
+    let resetState = true;
+    const mockClientRequire = (specifier) => {
+      if (specifier === "zod") return originalRequire("zod");
+      if (specifier === "@getpaseo/plugin/client") return {};
+      if (specifier === "@getpaseo/plugin/client/ui") {
+        return { Icon: "Icon", StreamedText: "StreamedText" };
+      }
+      if (specifier === "react-native") {
+        return { View: "View", Text: "Text", Pressable: "Pressable" };
+      }
+      if (specifier === "react/jsx-runtime") {
+        return {
+          Fragment: "Fragment",
+          jsx: (type, props) => ({ type, props }),
+          jsxs: (type, props) => ({ type, props }),
+        };
+      }
+      if (specifier === "react") {
+        return {
+          useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+          useEffect: (fn) => {
+            fn();
+          },
+          useMemo: (fn) => fn(),
+          useState: (initial) => {
+            if (resetState) {
+              stateSlot = typeof initial === "function" ? initial() : initial;
+              resetState = false;
+            }
+            const setState = (next) => {
+              stateSlot = typeof next === "function" ? next(stateSlot) : next;
+            };
+            return [stateSlot, setState];
+          },
+        };
+      }
+      throw new Error("Unexpected client require: " + specifier);
+    };
+
+    const clientExports = runInThisContext(compiled.clientBundle)(
+      mockClientRequire,
+    );
+    let transformer;
+    let renderer;
+    const cleanup = clientExports.default({
+      paseo: {
+        agents: {
+          subscribe: () => () => {},
+          list: async () => ({
+            entries: [
+              { agent: { id: "agy-root-1", provider: "antigravity" } },
+              { agent: { id: "codex-root-1", provider: "codex" } },
+            ],
+            subscription: {
+              subscribe() {},
+            },
+          }),
+          ref: (agentId) => ({
+            refresh: async () =>
+              agentId === "agy-archived-1"
+                ? { agent: { id: "agy-archived-1", provider: "antigravity" } }
+                : null,
+          }),
+        },
+      },
+      addTimelineTransformer(value) {
+        transformer = value;
+        return () => {};
+      },
+      addTimelineRenderer(value) {
+        renderer = value;
+        return () => {};
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (!transformer || !renderer) {
+      throw new Error("Client contribution did not register timeline hooks");
+    }
+
+    const emptyResult = transformer.transform({
+      item: { type: "reasoning", text: "   " },
+      phase: "streaming",
+    });
+    const streamingResult = transformer.transform({
+      item: { type: "reasoning", text: "Checking build graph..." },
+      phase: "streaming",
+    });
+    const parsedData = renderer.schema.parse(streamingResult.items[0].data);
+
+    const theme = {
+      colors: {
+        surface0: "#000",
+        surface1: "#111",
+        surface2: "#222",
+        border: "#333",
+        foreground: "#fff",
+        foregroundMuted: "#aaa",
+        accent: "#0af",
+        accentForeground: "#000",
+        statusSuccess: "#0f0",
+        statusWarning: "#ff0",
+        statusDanger: "#f00",
+      },
+    };
+    const findNode = (node, targetType) => {
+      if (!node || typeof node !== "object") return null;
+      if (node.type === targetType) return node;
+      const children = node.props?.children;
+      if (Array.isArray(children)) {
+        for (const child of children) {
+          const found = findNode(child, targetType);
+          if (found) return found;
+        }
+        return null;
+      }
+      return findNode(children, targetType);
+    };
+    const renderFor = (agentId, fresh = true) => {
+      if (fresh) resetState = true;
+      const tree = renderer.Component({
+        agentId,
+        item: {
+          type: "plugin",
+          kind: streamingResult.items[0].kind,
+          version: streamingResult.items[0].version,
+          data: parsedData,
+        },
+        timestamp: new Date("2026-01-01T00:00:00.000Z"),
+        theme,
+        host: { id: "local", label: "Local" },
+        layout: { compact: false, platform: "web" },
+      });
+      const streamed = findNode(tree, "StreamedText");
+      const pressable = findNode(tree, "Pressable");
+      return {
+        expanded: Boolean(streamed),
+        text: streamed?.props?.text ?? null,
+        phase: streamed?.props?.phase ?? null,
+        press: pressable?.props?.onPress,
+      };
+    };
+
+    const agyRoot = renderFor("agy-root-1");
+    agyRoot.press();
+    const agyRootAfterCollapse = renderFor("agy-root-1", false);
+
+    const agyChild = renderFor(
+      "agy-child:12345678-1234-4123-8123-123456789abc",
+    );
+
+    renderFor("agy-archived-1");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const agyArchived = renderFor("agy-archived-1", false);
+
+    const codexDefault = renderFor("codex-root-1");
+    codexDefault.press();
+    const codexAfterExpand = renderFor("codex-root-1", false);
+
+    await cleanup();
+    console.log(
+      JSON.stringify({
+        queryItemType: transformer.query.itemType,
+        emptySkipped: emptyResult === undefined,
+        kind: streamingResult.items[0].kind,
+        agyRootExpanded: agyRoot.expanded,
+        agyRootText: agyRoot.text,
+        agyRootPhase: agyRoot.phase,
+        agyRootAfterCollapse: agyRootAfterCollapse.expanded,
+        agyChildExpanded: agyChild.expanded,
+        agyArchivedExpanded: agyArchived.expanded,
+        codexDefaultExpanded: codexDefault.expanded,
+        codexAfterExpand: codexAfterExpand.expanded,
+      }),
+    );
   } else if (mode === "legacy") {
     // Other plugins still use description; the summary patch must not break them.
     let listener;

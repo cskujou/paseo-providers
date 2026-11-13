@@ -1,5 +1,12 @@
 import { createInterface } from "node:readline";
-import { mkdirSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
+import {
+  mkdirSync,
+  writeFileSync,
+  appendFileSync,
+  existsSync,
+  readFileSync,
+} from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 
 if (process.argv.includes("models")) {
@@ -11,6 +18,10 @@ if (process.argv.includes("models")) {
 appendFileSync(
   path.join(process.env.HOME, "fixture-processes.txt"),
   process.pid + "\n",
+);
+appendFileSync(
+  path.join(process.env.HOME, "fixture-args.txt"),
+  process.argv.slice(2).join(" ") + "\n",
 );
 let controlledTool = false;
 let model = process.env.FIXTURE_MODEL ?? "gemini-4-carbon";
@@ -89,6 +100,104 @@ function chunk(type, text, id) {
     ...(id ? { messageId: id } : {}),
   });
 }
+function pbVarint(value) {
+  const bytes = [];
+  let remaining = BigInt(value);
+  while (remaining >= 0x80n) {
+    bytes.push(Number((remaining & 0x7fn) | 0x80n));
+    remaining >>= 7n;
+  }
+  bytes.push(Number(remaining));
+  return Buffer.from(bytes);
+}
+function pbVarintField(field, value) {
+  return Buffer.concat([pbVarint(field << 3), pbVarint(value)]);
+}
+function pbBytesField(field, payload) {
+  const buf = typeof payload === "string" ? Buffer.from(payload) : payload;
+  return Buffer.concat([pbVarint((field << 3) | 2), pbVarint(buf.length), buf]);
+}
+function openFixtureDb() {
+  const dbPath = path.join(
+    process.env.HOME,
+    ".gemini",
+    "antigravity-cli",
+    "conversations",
+    sessionId + ".db",
+  );
+  mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath, { timeout: 2000 });
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB, step_payload BLOB)",
+  );
+  for (const table of [
+    "gen_metadata",
+    "executor_metadata",
+    "parent_references",
+    "battle_mode_infos",
+  ]) {
+    db.exec(`CREATE TABLE IF NOT EXISTS ${table} (idx INTEGER PRIMARY KEY)`);
+  }
+  return db;
+}
+function insertDbStep(db, stepType, status, metadata, payload) {
+  const row = db
+    .prepare("SELECT COALESCE(MAX(idx) + 1, 0) AS nextIdx FROM steps")
+    .get();
+  const idx = Number(row.nextIdx ?? 0);
+  db.prepare("INSERT INTO steps VALUES (?, ?, ?, ?, ?)").run(
+    idx,
+    stepType,
+    status,
+    metadata ?? Buffer.alloc(0),
+    payload ?? Buffer.alloc(0),
+  );
+  for (const table of [
+    "gen_metadata",
+    "executor_metadata",
+    "parent_references",
+    "battle_mode_infos",
+  ]) {
+    db.prepare(`INSERT INTO ${table} VALUES (?)`).run(idx);
+  }
+  return idx;
+}
+function buildErrorStepPayload(shortError, httpStatus = 400) {
+  return pbBytesField(
+    24,
+    Buffer.concat([
+      pbBytesField(
+        3,
+        Buffer.concat([
+          pbBytesField(1, "Agent execution terminated due to error."),
+          pbBytesField(2, shortError),
+          pbVarintField(7, httpStatus),
+        ]),
+      ),
+      pbVarintField(5, 1),
+    ]),
+  );
+}
+function buildCompactionMetadata(preTokens) {
+  return Buffer.concat([
+    pbBytesField(
+      1,
+      Buffer.concat([pbVarintField(1, 1_762_992_000), pbVarintField(2, 0)]),
+    ),
+    pbBytesField(
+      9,
+      Buffer.concat([
+        pbVarintField(2, 10_000),
+        pbVarintField(5, preTokens - 10_000),
+      ]),
+    ),
+  ]);
+}
+if (process.env.FIXTURE_DB === "1") {
+  const db = openFixtureDb();
+  db.close();
+}
 const input = createInterface({ input: process.stdin });
 input.on("close", () => process.exit(0));
 input.on("line", (line) => {
@@ -119,6 +228,19 @@ input.on("line", (line) => {
     case "session/load": {
       if (process.env.FIXTURE_EMPTY_LOAD === "1") {
         reply(f, { configOptions: options() });
+        break;
+      }
+      if (process.env.FIXTURE_LOAD_COMPACT === "1") {
+        const frames = [
+          chunk("user_message_chunk", "u1", "u1"),
+          chunk("agent_message_chunk", "a1", "a1"),
+          chunk("user_message_chunk", "/compact", "u2"),
+          chunk("agent_message_chunk", "compacted reply", "a2"),
+          chunk("user_message_chunk", "u3", "u3"),
+          chunk("agent_message_chunk", "a3", "a3"),
+          { id: f.id, result: { configOptions: options() } },
+        ];
+        process.stdout.write(frames.map(frame).join(""));
         break;
       }
       const ids = process.env.FIXTURE_MESSAGE_IDS === "1";
@@ -568,6 +690,126 @@ input.on("line", (line) => {
         }, 80);
         break;
       }
+      if (
+        text === "transient-silent-error" ||
+        text === "nonretryable-silent-error" ||
+        text === "shell-then-silent-error" ||
+        text === "edit-then-silent-error"
+      ) {
+        const counterFile = path.join(process.env.HOME, "retry-attempts.txt");
+        const previousAttempts = existsSync(counterFile)
+          ? readFileSync(counterFile, "utf8").trim().split("\n").filter(Boolean)
+              .length
+          : 0;
+        appendFileSync(counterFile, `${process.pid}:${previousAttempts + 1}\n`);
+        const db = openFixtureDb();
+        const existingStepCount = Number(
+          db.prepare("SELECT COUNT(*) AS count FROM steps").get().count ?? 0,
+        );
+        insertDbStep(db, 14, 3);
+        if (text === "shell-then-silent-error") {
+          send(
+            update("tool_call", {
+              toolCallId: "shell-1",
+              name: "run_command",
+              kind: "execute",
+              status: "in_progress",
+              rawInput: { CommandLine: "echo side-effect" },
+            }),
+          );
+          send(
+            update("tool_call_update", {
+              toolCallId: "shell-1",
+              status: "completed",
+              rawOutput: "side-effect",
+            }),
+          );
+        }
+        if (text === "edit-then-silent-error" && previousAttempts === 0) {
+          const targetFile = path.join(process.cwd(), "edited.txt");
+          send(
+            update("tool_call", {
+              toolCallId: "edit-1",
+              name: "write_file",
+              kind: "edit",
+              status: "in_progress",
+              rawInput: { Path: targetFile, Content: "corrupted-partial-edit" },
+            }),
+          );
+          writeFileSync(targetFile, "corrupted-partial-edit");
+          send(
+            update("tool_call_update", {
+              toolCallId: "edit-1",
+              status: "completed",
+            }),
+          );
+        }
+        if (
+          previousAttempts === 0 ||
+          text === "nonretryable-silent-error" ||
+          text === "shell-then-silent-error"
+        ) {
+          const shortError =
+            text === "nonretryable-silent-error"
+              ? "Your AI credits balance is too low to continue."
+              : "FAILED_PRECONDITION (code 400): User location is not supported for the API use.";
+          insertDbStep(
+            db,
+            17,
+            3,
+            Buffer.alloc(0),
+            buildErrorStepPayload(shortError),
+          );
+          db.close();
+          send(
+            chunk(
+              "agent_message_chunk",
+              "Agent execution terminated due to error.",
+            ),
+          );
+          reply(f, { stopReason: "end_turn" });
+          break;
+        }
+        insertDbStep(db, 15, 3);
+        db.close();
+        const editedCheck =
+          text === "edit-then-silent-error"
+            ? ":" + readFileSync(path.join(process.cwd(), "edited.txt"), "utf8")
+            : "";
+        send(
+          chunk(
+            "agent_message_chunk",
+            `RECOVERED_AFTER_REWIND(stepsBefore=${existingStepCount}${editedCheck})`,
+          ),
+        );
+        reply(f, { stopReason: "end_turn" });
+        break;
+      }
+      if (text === "/compact" || text === "auto-compact-turn") {
+        const db = openFixtureDb();
+        insertDbStep(db, 14, 3);
+        const preTokens = text === "/compact" ? 120_000 : 245_000;
+        const compactStepIdx = insertDbStep(db, 23, 2);
+        db.close();
+        setTimeout(() => {
+          const dbDone = openFixtureDb();
+          dbDone
+            .prepare("UPDATE steps SET status = 3, metadata = ? WHERE idx = ?")
+            .run(buildCompactionMetadata(preTokens), compactStepIdx);
+          insertDbStep(dbDone, 15, 3);
+          dbDone.close();
+          send(
+            chunk(
+              "agent_message_chunk",
+              text === "/compact"
+                ? "Manual compact complete."
+                : "Auto compact turn complete.",
+            ),
+          );
+          reply(f, { stopReason: "end_turn" });
+        }, 320);
+        break;
+      }
       if (text === "hold") {
         activePrompt = f;
         break;
@@ -579,6 +821,72 @@ input.on("line", (line) => {
           token: "private-token",
           request: { prompt: "do not log task" },
         });
+        break;
+      }
+      if (text === "inband-error-once") {
+        const flag = path.join(process.env.HOME, "inband-error-once.flag");
+        if (!existsSync(flag)) {
+          writeFileSync(flag, "1");
+          send(
+            chunk(
+              "agent_message_chunk",
+              "\n⚠ Agent execution terminated due to error.\n",
+            ),
+          );
+          reply(f, { stopReason: "end_turn" });
+          break;
+        }
+        send(chunk("agent_message_chunk", "RECOVERED_OK"));
+        reply(f, { stopReason: "end_turn" });
+        break;
+      }
+      if (text === "inband-error-always") {
+        send(
+          chunk(
+            "agent_message_chunk",
+            "\n⚠ Agent execution terminated due to error.\n",
+          ),
+        );
+        reply(f, { stopReason: "end_turn" });
+        break;
+      }
+      if (text === "inband-error-literal-reply") {
+        const dir = path.join(
+          process.env.HOME,
+          ".gemini",
+          "antigravity-cli",
+          "brain",
+          sessionId,
+          ".system_generated",
+          "logs",
+        );
+        mkdirSync(dir, { recursive: true });
+        appendFileSync(
+          path.join(dir, "transcript.jsonl"),
+          [
+            {
+              type: "USER_INPUT",
+              step_index: 0,
+              status: "DONE",
+              content: text,
+            },
+            {
+              type: "PLANNER_RESPONSE",
+              step_index: 1,
+              status: "DONE",
+              content: "⚠ Agent execution terminated due to error.",
+            },
+          ]
+            .map((r) => JSON.stringify(r))
+            .join("\n") + "\n",
+        );
+        send(
+          chunk(
+            "agent_message_chunk",
+            "⚠ Agent execution terminated due to error.",
+          ),
+        );
+        reply(f, { stopReason: "end_turn" });
         break;
       }
       if (text === "fail-process") {

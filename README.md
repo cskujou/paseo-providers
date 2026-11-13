@@ -16,10 +16,15 @@ paseo-providers/
 ├── templates/
 │   └── provider-template/                    # 新建自定义 Provider 的标准脚手架模板（./install.sh --new 自动调用）
 └── providers/
-    ├── antigravity-provider/                 # [已内置] Antigravity ACP Provider + 4 窗口额度监控
+    ├── antigravity-provider/                 # [已内置] Antigravity ACP Provider + 客户端内联思考展示 + 4 窗口额度监控
     │   ├── paseo-plugin.json
     │   ├── icon.svg
+    │   ├── index.client.tsx
     │   ├── index.server.ts
+    │   ├── client/
+    │   │   └── inline-thinking.tsx
+    │   ├── shared/
+    │   │   └── inline-thinking.ts
     │   └── server/
     │       ├── usage.ts
     │       ├── provider.ts
@@ -62,6 +67,9 @@ paseo-providers/
 - 从 agy CLI 获取模型目录，从 ACP 会话读取实际模型、模式、思考等级和自定义选择项。
 - 支持消息、斜杠命令、图片、文本附件、上传文件路径、MCP 配置、交互权限和取消当前回合。
 - 支持会话列表分页、首尾 prompt 摘要、摘要搜索、导入、持久化恢复和有序历史重放。摘要去除注入元数据并限制为 160 个字符；无标题时使用首条 prompt。ACP 没有发送历史时，从本地转录恢复消息、工具结果、退出码和原始时间戳。
+- 支持 Antigravity 思考过程直接展开显示（非默认折叠）：通过插件客户端入口 `index.client.tsx` 注册 `addTimelineTransformer` 与 `addTimelineRenderer`，对 Antigravity 主会话及 `agy-child:*` 子代理的 `reasoning` 时间线项默认直接内联展开渲染流式与已完成思考正文（仍支持点击标题手动收起），而其他 Provider（如 Codex、Claude）保持默认折叠。
+- 支持上下文压缩（`compaction`）时间线事件展示：实时监控会话及子代理的 `CHECKPOINT`（`step_type = 23`）步骤，覆盖手动 `/compact`、自动上下文压缩、后台续写、ACP `session/load` 重放与本地转录导入，向 Paseo 发送 `loading` -> `completed` 状态、触发方式（`manual` / `auto`）以及压缩前 token 数（`preTokens`）。
+- 支持瞬时上游执行错误的自动回退与重试：当 `agy` 因代理池坏出口节点、上游连接抖动或进程异常退出返回瞬时错误（包括仅输出 `Agent execution terminated due to error.` 且在 SQLite `step_type = 17` 记录 `User location is not supported`、`UNAVAILABLE`、`INTERNAL`、`429`/`5xx` 等瞬时故障）时，自动销毁污染的 ACP 进程、按需回滚文件检查点并截断失败回合的会话记录后重新提交提示（可通过 `PASEO_AGY_AUTO_RETRY_MAX` 与 `PASEO_AGY_AUTO_RETRY_DELAY_MS` 配置，默认最多重试 3 次）。已产生不可回退副作用（如 `run_command`、子代理、MCP 调用）或属于额度/鉴权/参数等永久性错误时不自动重试。
 - 提供对话、文件和两者同时回退。文件检查点保存在 agy 数据目录的 `paseo-rewind/` 中，可跨进程恢复；对话截断前保留数据库副本。
 - 显示四个额度窗口。采集明确使用账户的 home 目录，不继承 daemon 的项目目录。遇到信任确认页不自动批准；启动失败、执行失败和无法识别额度输出分别报错，不把过期缓存显示为当前额度。
 
@@ -112,6 +120,7 @@ ACP 没有可靠的 steer 接受确认，因此不宣告 `prompt.steer`。也不
 | 计划审批 | 工件反馈条件、计划卡片、批准后模式提交与实施、拒绝、模式切换失败、待审批恢复与拒绝状态保留 |
 | 子代理 | 真实子会话、父子关联、独立历史、嵌套、完成与失败、取消、导入恢复及父模型自动续写 |
 | 后台任务 | 命令完成、定时唤醒、链式定时器、Cron 次数、条件取消及前台工具排空 |
+| 重试、压缩与思考 UI | 瞬时错误自动回退与重试、`compaction` 时间线透传、`clientBundle` 编译与 Antigravity 思考默认内联展开 |
 | 未支持的能力 | steer、结构化输出和精确 MCP 预授权不宣告或明确拒绝；子会话不支持独立交互 |
 
 Paseo 的本地归档与 agy 原生归档是不同能力。未宣告原生归档不会阻止 Paseo 归档本地代理。真实 Gemini 3.8 Flash 后台命令及下一轮已验证共用同一个存活 ACP 进程；编译后的 provider 也已验证计划审批后实际写入与读取文件，以及真实子代理的读取结果、独立历史、父工具关联和父模型续写。费用与逐回合 token 明细、跨平台行为和浏览器界面尚未验证，不能据此宣称与 Pi、Claude、Codex 功能完全一致。

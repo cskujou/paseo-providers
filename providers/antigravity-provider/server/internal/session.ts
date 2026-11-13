@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
-import { readBackgroundTurn } from "./background.js";
+import {
+  inspectTurnExecutionFailure,
+  readBackgroundTurn,
+} from "./background.js";
 import { planFromTool, readPendingPlan, type PlanProposal } from "./plan.js";
 import { SubagentTracker } from "./subagents.js";
 import {
@@ -49,10 +52,16 @@ import {
 import {
   RevertTokenSchema,
   SessionRewindTracker,
+  hasConversationDb,
+  readConversationTurnError,
   readUserStepIndices,
+  type RevertToken,
 } from "./rewind.js";
 import {
+  readTranscriptCompactionSteps,
   readTranscriptTimeline,
+  statTranscriptOffset,
+  type TranscriptCompactionStep,
   type TranscriptTimelineItem,
 } from "./transcript-history.js";
 import {
@@ -62,6 +71,38 @@ import {
   mergeAcpToolCall,
   type AcpToolCallState,
 } from "./timeline.js";
+
+const TERMINATED_ERROR_TEXT = "Agent execution terminated due to error.";
+const MAX_PROMPT_EXECUTION_RETRIES = 2;
+const INBAND_EXECUTION_ERROR_RE =
+  /^(?:⚠\s*)?Agent execution terminated due to error\.?$/u;
+const DEFAULT_AUTO_RETRY_MAX = 3;
+const DEFAULT_AUTO_RETRY_DELAY_MS = 600;
+const LIVE_COMPACTION_POLL_MS = 300;
+
+const READ_ONLY_TOOL_NAMES = new Set([
+  "read_file",
+  "view_file",
+  "list_dir",
+  "list_directory",
+  "grep_search",
+  "find_by_name",
+  "search_web",
+  "read_url_content",
+  "list_resources",
+  "read_resource",
+]);
+
+const FILE_EDIT_TOOL_NAMES = new Set([
+  "edit_file",
+  "replace_file_content",
+  "multi_replace_file_content",
+  "write_file",
+  "write_to_file",
+]);
+
+const NON_RETRYABLE_ERROR_PATTERN =
+  /\b(unauthenticated|unauthorized|not logged in|sign[- ]?in|log[- ]?in|invalid[_ ]?api[_ ]?key|invalid[_ ]?grant|credits? balance is too low|insufficient[_ ]?(?:credits|funds)|billing|payment required|content safety|safety filters?|policy violation|prohibited content|INVALID_ARGUMENT|NOT_FOUND|PERMISSION_DENIED)\b/i;
 
 const persistenceDataSchema = z
   .object({
@@ -113,9 +154,33 @@ export function parsePersistenceConversationId(
   };
 }
 
+function isInbandExecutionErrorPrefix(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  return (
+    ("⚠ Agent execution terminated due to error.".startsWith(trimmed) &&
+      (trimmed.startsWith("⚠") ||
+        trimmed.startsWith("Agent execution terminated"))) ||
+    ("Agent execution terminated due to error.".startsWith(trimmed) &&
+      trimmed.startsWith("Agent execution terminated"))
+  );
+}
+
 interface ActiveTurn {
   id: string;
+  attempt: number;
+  awaitingPromptResponse: boolean;
+  hasUnrevertableTool: boolean;
+  hasFileModification: boolean;
+  deferredAssistantItems: Map<string, ProviderTimelineItem>;
+  compactionMarkerOpen: boolean;
+  openCompactionId?: string;
+  openCompactionTrigger?: "auto" | "manual";
+  emittedCompactionSteps: Set<number>;
+  retried: boolean;
   canceled: boolean;
+  sawInbandError?: boolean;
+  heldErrorChunk?: { id: string; text: string };
   completion: Promise<void>;
   resolve(): void;
   activity: ReturnType<typeof Promise.withResolvers<void>>;
@@ -162,6 +227,8 @@ export class Session {
   private replayMode: "none" | "replay" | "skip" = "none";
   private replayUserStepIndices: number[] = [];
   private replayUserTurnCount = 0;
+  private replayCompactions: TranscriptCompactionStep[] = [];
+  private replayCompactionCursor = 0;
   private readonly bufferedReplayItems: TranscriptTimelineItem[] = [];
   private restarting = false;
   private closed = false;
@@ -328,11 +395,18 @@ export class Session {
           "NO_CONVERSATION",
         );
       const { acpPrompt, displayText } = this.encodePrompt(prompt);
+      const manualCompact =
+        (prompt.input.type === "command" && prompt.input.name === "compact") ||
+        /^\/compact(?:\s|$)/i.test(displayText.trim());
       const previousBackground = await readBackgroundTurn(
         this.conversationId,
         this.mergedEnv,
       );
-      const revertToken = await this.rewindTracker.createTurnToken(
+      let transcriptBefore = await statTranscriptOffset(
+        this.conversationId,
+        this.mergedEnv,
+      );
+      let revertToken: RevertToken = await this.rewindTracker.createTurnToken(
         this.conversationId,
         prompt.clientMessageId,
       );
@@ -344,6 +418,14 @@ export class Session {
       const completion = Promise.withResolvers<void>();
       turn = {
         id: randomUUID(),
+        attempt: 0,
+        awaitingPromptResponse: false,
+        hasUnrevertableTool: false,
+        hasFileModification: false,
+        deferredAssistantItems: new Map(),
+        compactionMarkerOpen: false,
+        emittedCompactionSteps: new Set(),
+        retried: false,
         canceled: false,
         completion: completion.promise,
         resolve: completion.resolve,
@@ -358,11 +440,7 @@ export class Session {
         model: this.config.model,
         mode: this.config.mode,
       });
-      this.messages.clear();
-      for (const id of this.toolCalls.keys()) this.retiredToolCalls.add(id);
-      this.toolCalls.clear();
-      this.linkedSubagentCalls.clear();
-      this.fallbackChunkIds.clear();
+      this.resetAttemptState(turn);
       this.pendingPrompt = null;
       this.emit({
         type: "session.prompt_result",
@@ -385,44 +463,254 @@ export class Session {
         revertToken,
       });
       let completed = false;
+      const maxRetries = this.autoRetryMax();
+      const baseRetryDelayMs = this.autoRetryDelayMs();
       try {
-        const response = z
-          .object({
-            stopReason: z.enum([
-              "end_turn",
-              "cancelled",
-              "max_tokens",
-              "max_turn_requests",
-              "refusal",
-            ]),
-          })
-          .parse(
-            await client.request(
-              "session/prompt",
-              { sessionId: this.conversationId, prompt: acpPrompt },
-              null,
-            ),
+        let canceled = false;
+        while (true) {
+          if (manualCompact && !turn.compactionMarkerOpen) {
+            this.openCompactionMarker(
+              turn,
+              this.turnScope(turn) + ":compaction:manual",
+              "manual",
+            );
+          }
+          let stopCompactionWatch = false;
+          const compactionWatch = this.watchLiveCompactions(
+            turn,
+            revertToken.stepIndex,
+            manualCompact,
+            () => stopCompactionWatch,
           );
-        if (this.activeTurn !== turn) return;
-        logDiagnostic("turn.prompt_response", {
-          sessionId: this.options.id,
-          conversationId: this.conversationId,
-          turnId: turn.id,
-          stopReason: response.stopReason,
-          runningTools: [...this.toolCalls.values()].filter(
-            (t) => t.status === "pending" || t.status === "in_progress",
-          ).length,
-        });
-        const canceled = turn.canceled || response.stopReason === "cancelled";
-        if (!canceled && response.stopReason !== "end_turn")
-          throw new AntigravityError(
-            "Antigravity stopped: " + response.stopReason,
-            "TURN_LIMIT",
-          );
-        if (!canceled) {
-          await this.waitForBackgroundTurn(turn);
-          await this.waitForTurnTools(turn);
-          await this.waitForSubagents(turn);
+          turn.awaitingPromptResponse = true;
+          try {
+            const response = z
+              .object({
+                stopReason: z.enum([
+                  "end_turn",
+                  "cancelled",
+                  "max_tokens",
+                  "max_turn_requests",
+                  "refusal",
+                ]),
+              })
+              .parse(
+                await client.request(
+                  "session/prompt",
+                  { sessionId: this.conversationId, prompt: acpPrompt },
+                  null,
+                ),
+              );
+            turn.awaitingPromptResponse = false;
+            stopCompactionWatch = true;
+            turn.activity.resolve();
+            await compactionWatch;
+            if (this.activeTurn === turn) {
+              turn.activity = Promise.withResolvers<void>();
+            }
+            if (this.activeTurn !== turn) return;
+            await this.syncLiveCompactions(
+              turn,
+              revertToken.stepIndex,
+              manualCompact,
+            );
+            logDiagnostic("turn.prompt_response", {
+              sessionId: this.options.id,
+              conversationId: this.conversationId,
+              turnId: turn.id,
+              attempt: turn.attempt,
+              stopReason: response.stopReason,
+              runningTools: [...this.toolCalls.values()].filter(
+                (t) => t.status === "pending" || t.status === "in_progress",
+              ).length,
+            });
+            canceled = turn.canceled || response.stopReason === "cancelled";
+            if (!canceled && response.stopReason !== "end_turn")
+              throw new AntigravityError(
+                "Antigravity stopped: " + response.stopReason,
+                "TURN_LIMIT",
+              );
+            if (!canceled) {
+              const silentError = this.detectSilentTurnError(
+                revertToken.stepIndex,
+              );
+              if (silentError) throw silentError;
+              if (this.conversationId && response.stopReason === "end_turn") {
+                const inspection = await inspectTurnExecutionFailure(
+                  this.conversationId,
+                  this.mergedEnv,
+                  transcriptBefore,
+                  Boolean(turn.sawInbandError),
+                );
+                if (this.activeTurn !== turn) return;
+                if (inspection.failed) {
+                  turn.heldErrorChunk = undefined;
+                  turn.sawInbandError = false;
+                  const canRetry =
+                    !turn.canceled &&
+                    !this.closed &&
+                    this.toolCalls.size === 0 &&
+                    this.messages.size === 0 &&
+                    turn.attempt < MAX_PROMPT_EXECUTION_RETRIES;
+                  if (!this.hasDaemonTasks) {
+                    await this.recycleClientForRetry(client);
+                  }
+                  if (this.activeTurn !== turn) return;
+                  if (turn.canceled || this.closed) {
+                    canceled = true;
+                    this.closeOpenCompactionMarker(turn);
+                    break;
+                  }
+                  if (canRetry && !this.hasDaemonTasks) {
+                    logDiagnostic("turn.retrying_execution_error", {
+                      sessionId: this.options.id,
+                      conversationId: this.conversationId,
+                      turnId: turn.id,
+                      attempt: turn.attempt + 1,
+                    });
+                    const reverted = await this.rewindTracker
+                      .revertConversation(this.conversationId, revertToken)
+                      .then(() => true)
+                      .catch(() => false);
+                    if (reverted && this.conversationId) {
+                      revertToken = await this.rewindTracker.createTurnToken(
+                        this.conversationId,
+                        prompt.clientMessageId,
+                      );
+                      this.emitItem({
+                        type: "user_message",
+                        id: prompt.clientMessageId,
+                        messageId: prompt.clientMessageId,
+                        clientMessageId: prompt.clientMessageId,
+                        text: displayText,
+                        revertToken,
+                      });
+                    }
+                    this.fallbackChunkIds.clear();
+                    turn.attempt += 1;
+                    this.resetAttemptState(turn);
+                    client = await this.ensureClient();
+                    if (!this.conversationId || this.activeTurn !== turn)
+                      return;
+                    transcriptBefore = await statTranscriptOffset(
+                      this.conversationId,
+                      this.mergedEnv,
+                    );
+                    if (this.activeTurn !== turn) return;
+                    continue;
+                  }
+                  this.closeOpenCompactionMarker(turn);
+                  throw new AntigravityError(
+                    inspection.message ??
+                      "Agent execution terminated due to error.",
+                    "AGENT_EXECUTION_ERROR",
+                    diagnosticDetails(inspection.details),
+                  );
+                }
+              }
+              this.flushHeldErrorChunk(turn);
+              this.flushDeferredAssistantItems(turn);
+              this.closeOpenCompactionMarker(turn);
+              await this.waitForBackgroundTurn(turn);
+              await this.waitForTurnTools(turn);
+              await this.waitForSubagents(turn);
+            } else {
+              this.closeOpenCompactionMarker(turn);
+            }
+            break;
+          } catch (attemptError) {
+            turn.awaitingPromptResponse = false;
+            stopCompactionWatch = true;
+            turn.activity.resolve();
+            await compactionWatch;
+            if (this.activeTurn === turn) {
+              turn.activity = Promise.withResolvers<void>();
+            }
+            if (this.activeTurn !== turn) return;
+            if (
+              !(await this.canAutoRetryAttempt(
+                attemptError,
+                turn,
+                revertToken,
+                maxRetries,
+              ))
+            ) {
+              this.flushNonErrorDeferredAssistantItems(turn);
+              this.closeOpenCompactionMarker(turn);
+              throw attemptError;
+            }
+            const nextAttempt = turn.attempt + 1;
+            turn.retried = true;
+            this.closeOpenCompactionMarker(turn);
+            this.finishRunningTools("canceled");
+            turn.deferredAssistantItems.clear();
+            const retrySummary = this.describeRetryReason(attemptError);
+            logDiagnostic(
+              "turn.auto_retry",
+              {
+                sessionId: this.options.id,
+                conversationId: this.conversationId,
+                turnId: turn.id,
+                attempt: nextAttempt,
+                maxRetries,
+                hadFileModification: turn.hasFileModification,
+              },
+              attemptError,
+            );
+            this.emit({
+              type: "session.notice",
+              sessionId: this.options.id,
+              notice: {
+                id: "auto-retry:" + turn.id,
+                severity: "warning",
+                title: `Transient Antigravity error; rewinding and retrying (${nextAttempt}/${maxRetries})`,
+                description: retrySummary,
+              },
+            });
+            await this.recycleClientForRetry(client);
+            if (this.activeTurn !== turn) return;
+            if (turn.canceled || this.closed) {
+              canceled = true;
+              break;
+            }
+            const waitMs = baseRetryDelayMs * 2 ** (nextAttempt - 1);
+            if (waitMs > 0) {
+              turn.activity = Promise.withResolvers<void>();
+              await Promise.race([delay(waitMs), turn.activity.promise]);
+            }
+            if (this.activeTurn !== turn) return;
+            if (turn.canceled || this.closed) {
+              canceled = true;
+              break;
+            }
+            if (turn.hasFileModification) {
+              await this.rewindTracker.revertFiles(revertToken);
+            }
+            await this.rewindTracker.revertAttemptConversation(
+              this.conversationId,
+              revertToken,
+            );
+            revertToken = await this.rewindTracker.createTurnToken(
+              this.conversationId,
+              prompt.clientMessageId,
+            );
+            this.emitItem({
+              type: "user_message",
+              id: prompt.clientMessageId,
+              messageId: prompt.clientMessageId,
+              clientMessageId: prompt.clientMessageId,
+              text: displayText,
+              revertToken,
+            });
+            turn.attempt = nextAttempt;
+            this.resetAttemptState(turn);
+            client = await this.startAcpClient("skip");
+            if (this.activeTurn !== turn) return;
+            if (turn.canceled || this.closed) {
+              canceled = true;
+              break;
+            }
+          }
         }
         if (this.activeTurn !== turn) return;
         if (turn.canceled || canceled) {
@@ -439,6 +727,7 @@ export class Session {
           sessionId: this.options.id,
           conversationId: this.conversationId,
           turnId: turn.id,
+          attempts: turn.attempt + 1,
           state: turn.canceled || canceled ? "canceled" : "completed",
         });
         this.emit({
@@ -449,6 +738,7 @@ export class Session {
         });
       } catch (error) {
         if (this.activeTurn !== turn) return;
+        this.closeOpenCompactionMarker(turn);
         this.finishRunningTools(turn.canceled ? "canceled" : "failed");
         logDiagnostic(
           "turn.failed",
@@ -456,6 +746,7 @@ export class Session {
             sessionId: this.options.id,
             conversationId: this.conversationId,
             turnId: turn.id,
+            attempts: turn.attempt + 1,
             canceled: turn.canceled,
           },
           error,
@@ -468,9 +759,23 @@ export class Session {
           ...(turn.canceled ? {} : { error: providerError(error) }),
         });
       } finally {
+        if (!turn.sawInbandError) this.flushHeldErrorChunk(turn);
+        turn.heldErrorChunk = undefined;
         if (this.activeTurn === turn) this.activeTurn = null;
         this.cancelPendingPermissions();
         this.fallbackChunkIds.clear();
+        if (turn.retried) {
+          this.emit({
+            type: "session.notice",
+            sessionId: this.options.id,
+            notice: {
+              id: "auto-retry:" + turn.id,
+              severity: "info",
+              title: "Antigravity auto-retry finished",
+              dismissed: true,
+            },
+          });
+        }
         if (turn.canceled && turn.backgroundPhase)
           this.emit({
             type: "session.notice",
@@ -620,10 +925,18 @@ export class Session {
         let updated = 0;
         for (const item of items) {
           const step = /^history:(\d+):/.exec(item.id);
-          if (!step || Number(step[1]) < snapshot.continuationStep) continue;
+          const stepIndex = step ? Number(step[1]) : Number.NaN;
+          if (!step || stepIndex < snapshot.continuationStep) continue;
+          if (
+            item.type === "compaction" &&
+            turn.emittedCompactionSteps.has(stepIndex)
+          )
+            continue;
           const fingerprint = JSON.stringify(item);
           if (published.get(item.id) === fingerprint) continue;
           published.set(item.id, fingerprint);
+          if (item.type === "compaction" && item.status === "completed")
+            turn.emittedCompactionSteps.add(stepIndex);
           this.emitItem(item);
           if (item.type === "tool_call")
             logDiagnostic("background.tool", {
@@ -720,7 +1033,7 @@ export class Session {
         );
         if (!state || !this.activeTurn) return callId;
         this.linkedSubagentCalls.add(state.toolCallId);
-        const scoped = this.activeTurn.id + ":" + state.toolCallId;
+        const scoped = this.turnScope(this.activeTurn) + ":" + state.toolCallId;
         return scoped;
       },
     });
@@ -876,6 +1189,17 @@ export class Session {
           id,
           String(value),
         );
+      if (
+        this.client === client &&
+        client.skipPermissions !== selection.autoApproveAll &&
+        !this.activeTurn &&
+        !this.hasRunningTools() &&
+        !this.hasDaemonTasks &&
+        !this.subagents?.running &&
+        this.pendingPermissions.size === 0
+      ) {
+        await this.restartClientForPermissions(client);
+      }
     } finally {
       // A multi-option ACP change can partially commit before a later option fails.
       this.publishConfig();
@@ -1148,7 +1472,7 @@ export class Session {
     this.pendingPrompt?.abort();
     const turn = this.activeTurn;
     const client = this.client;
-    if (!turn || !client || !this.conversationId) return;
+    if (!turn || !this.conversationId) return;
     logDiagnostic("turn.interrupt_requested", {
       sessionId: this.options.id,
       conversationId: this.conversationId,
@@ -1158,6 +1482,10 @@ export class Session {
     turn.canceled = true;
     turn.activity.resolve();
     this.cancelPendingPermissions();
+    if (!client) {
+      await turn.completion;
+      return;
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
     try {
@@ -1225,6 +1553,23 @@ export class Session {
     }
   }
 
+  private shouldSkipPermissions(
+    config: ProviderSessionConfig = this.config,
+  ): boolean {
+    return normalizeSelection(config, this.sessionCatalog).autoApproveAll;
+  }
+
+  private async restartClientForPermissions(client: AcpClient): Promise<void> {
+    if (this.client !== client) return;
+    this.restarting = true;
+    try {
+      await this.recycleClientForRetry(client);
+      await this.startAcpClient("skip");
+    } finally {
+      this.restarting = false;
+    }
+  }
+
   private async ensureClient(): Promise<AcpClient> {
     if (this.starting) return this.starting;
     if (this.client) return this.client;
@@ -1256,6 +1601,7 @@ export class Session {
       launch: this.options.launch,
       cwd: this.config.cwd,
       env: this.mergedEnv,
+      skipPermissions: this.shouldSkipPermissions(),
       onSessionUpdate: (params) => {
         if (this.client === client) return this.handleSessionUpdate(params);
       },
@@ -1277,12 +1623,19 @@ export class Session {
 
       if (this.conversationId) {
         if (historyMode === "replay") {
-          const { userStepIndices } = await readUserStepIndices(
-            this.conversationId,
-            this.mergedEnv,
-          );
+          const [{ userStepIndices }, compactions] = await Promise.all([
+            readUserStepIndices(this.conversationId, this.mergedEnv),
+            readTranscriptCompactionSteps(
+              this.conversationId,
+              this.mergedEnv,
+            ).catch(() => []),
+          ]);
           this.replayUserStepIndices = userStepIndices;
           this.replayUserTurnCount = 0;
+          this.replayCompactions = compactions.filter(
+            (step) => step.status === "completed",
+          );
+          this.replayCompactionCursor = 0;
           this.bufferedReplayItems.length = 0;
         }
         this.replayMode = historyMode;
@@ -1326,14 +1679,17 @@ export class Session {
             );
           }
           await this.flushReplayUserChunk();
-          if (
-            historyMode === "replay" &&
-            this.bufferedReplayItems.length === 0
-          ) {
-            await this.replayTranscriptHistory();
+          if (historyMode === "replay") {
+            if (this.bufferedReplayItems.length === 0) {
+              await this.replayTranscriptHistory();
+            } else {
+              this.flushReplayCompactionsBefore(Number.POSITIVE_INFINITY);
+            }
           }
         } finally {
           this.replayMode = "none";
+          this.replayCompactions = [];
+          this.replayCompactionCursor = 0;
         }
       } else {
         const meta = this.config.systemPrompt
@@ -1635,9 +1991,51 @@ export class Session {
           ? (update.content as Record<string, unknown>)
           : {};
       if (content.type !== "text" || typeof content.text !== "string") return;
+      if (kind === "agent_thought_chunk" && this.activeTurn) {
+        if (this.replayMode === "none" && this.activeTurn.heldErrorChunk) {
+          this.flushHeldErrorChunk(this.activeTurn);
+        }
+        this.flushDeferredAssistantItems(this.activeTurn);
+      }
       const msgId =
         typeof update.messageId === "string" ? update.messageId : undefined;
       const id = this.resolveChunkId(kind, msgId);
+      if (
+        kind === "agent_message_chunk" &&
+        this.replayMode === "none" &&
+        this.activeTurn
+      ) {
+        if (
+          this.activeTurn.heldErrorChunk &&
+          this.activeTurn.heldErrorChunk.id !== id
+        ) {
+          this.flushHeldErrorChunk(this.activeTurn);
+        }
+        const existingText = this.messages.get(id);
+        const heldBase =
+          this.activeTurn.heldErrorChunk?.id === id
+            ? this.activeTurn.heldErrorChunk.text
+            : (existingText ?? "");
+        const candidate = `${heldBase}${content.text}`;
+        if (existingText === undefined) {
+          if (INBAND_EXECUTION_ERROR_RE.test(candidate.trim())) {
+            this.activeTurn.heldErrorChunk = { id, text: candidate };
+            this.activeTurn.sawInbandError = true;
+            return;
+          }
+          if (isInbandExecutionErrorPrefix(candidate)) {
+            this.activeTurn.heldErrorChunk = { id, text: candidate };
+            return;
+          }
+        } else if (INBAND_EXECUTION_ERROR_RE.test(content.text.trim())) {
+          this.activeTurn.heldErrorChunk = { id, text: candidate };
+          this.activeTurn.sawInbandError = true;
+          return;
+        }
+        if (this.activeTurn.heldErrorChunk) {
+          this.flushHeldErrorChunk(this.activeTurn);
+        }
+      }
       const text = `${this.messages.get(id) ?? ""}${content.text}`;
       this.messages.set(id, text);
 
@@ -1654,11 +2052,28 @@ export class Session {
               id,
               text,
             };
+      if (
+        kind === "agent_message_chunk" &&
+        this.replayMode === "none" &&
+        this.activeTurn
+      ) {
+        if (isPotentialTerminatedBanner(text)) {
+          this.activeTurn.deferredAssistantItems.set(id, item);
+          return;
+        }
+        this.activeTurn.deferredAssistantItems.delete(id);
+      }
       this.recordOrEmitTimelineItem(item);
       return;
     }
 
     if (kind === "tool_call" || kind === "tool_call_update") {
+      if (this.replayMode === "none" && this.activeTurn?.heldErrorChunk) {
+        this.flushHeldErrorChunk(this.activeTurn);
+      }
+      if (this.activeTurn) {
+        this.flushDeferredAssistantItems(this.activeTurn);
+      }
       if (kind === "tool_call") {
         this.fallbackChunkIds.clear();
       }
@@ -1683,6 +2098,9 @@ export class Session {
       const merged = mergeAcpToolCall(update, current);
       if (merged.kind === "execute" || merged.name === "run_command")
         await this.rewindTracker.recordShellOperation();
+      if (this.replayMode === "none" && this.activeTurn) {
+        this.classifyAttemptTool(this.activeTurn, merged);
+      }
       this.toolCalls.set(merged.toolCallId, merged);
       if (this.activeTurn && this.config.mode === "plan" && this.conversationId)
         this.activeTurn.plan =
@@ -1710,7 +2128,72 @@ export class Session {
       return;
     }
 
+    if (kind === "compaction_update") {
+      const rawId =
+        typeof update.compactionId === "string" && update.compactionId
+          ? update.compactionId
+          : "acp-compaction";
+      const rawStatus =
+        typeof update.status === "string" ? update.status : "completed";
+      if (
+        rawStatus === "failed" ||
+        rawStatus === "error" ||
+        rawStatus === "cancelled" ||
+        rawStatus === "canceled"
+      ) {
+        if (this.activeTurn) this.closeOpenCompactionMarker(this.activeTurn);
+        return;
+      }
+      const status =
+        rawStatus === "in_progress" ||
+        rawStatus === "pending" ||
+        rawStatus === "running" ||
+        rawStatus === "loading"
+          ? "loading"
+          : "completed";
+      const meta =
+        typeof update._meta === "object" && update._meta !== null
+          ? (update._meta as Record<string, unknown>)
+          : {};
+      const trigger =
+        meta.trigger === "manual" || update.trigger === "manual"
+          ? "manual"
+          : "auto";
+      const preTokens =
+        typeof update.preTokens === "number"
+          ? update.preTokens
+          : typeof meta.preTokens === "number"
+            ? meta.preTokens
+            : undefined;
+      const scopedId = this.activeTurn
+        ? `${this.turnScope(this.activeTurn)}:compaction:${rawId}`
+        : `history:compaction:${rawId}`;
+      if (status === "loading") {
+        if (this.replayMode === "replay") return;
+        if (this.activeTurn) {
+          this.openCompactionMarker(this.activeTurn, scopedId, trigger);
+        }
+        return;
+      }
+      if (this.activeTurn) {
+        this.activeTurn.compactionMarkerOpen = false;
+        this.activeTurn.openCompactionId = undefined;
+        this.activeTurn.openCompactionTrigger = undefined;
+      }
+      this.recordOrEmitTimelineItem({
+        type: "compaction",
+        id: scopedId,
+        status: "completed",
+        trigger,
+        ...(preTokens !== undefined ? { preTokens } : {}),
+      });
+      return;
+    }
+
     if (kind === "plan") {
+      if (this.activeTurn) {
+        this.flushDeferredAssistantItems(this.activeTurn);
+      }
       this.fallbackChunkIds.clear();
       const entries = Array.isArray(update.entries) ? update.entries : [];
       const item: ProviderTimelineItem = {
@@ -1773,6 +2256,10 @@ export class Session {
     const text = this.messages.get(id);
     if (!text || !this.conversationId) return;
     const turnIndex = this.replayUserTurnCount++;
+    const userStep = this.replayUserStepIndices[turnIndex];
+    if (userStep !== undefined) {
+      this.flushReplayCompactionsBefore(userStep);
+    }
     const revertToken = await this.rewindTracker.createReplayToken(
       this.conversationId,
       id,
@@ -1786,6 +2273,34 @@ export class Session {
       text,
       revertToken,
     });
+    if (userStep !== undefined) {
+      const isManualCompact = /^\/compact(?:\s|$)/i.test(text.trim());
+      this.flushReplayCompactionsBefore(
+        userStep + 2,
+        isManualCompact ? "manual" : undefined,
+      );
+    }
+  }
+
+  private flushReplayCompactionsBefore(
+    exclusiveStepIndex: number,
+    overrideTrigger?: "auto" | "manual",
+  ): void {
+    while (this.replayCompactionCursor < this.replayCompactions.length) {
+      const compaction = this.replayCompactions[this.replayCompactionCursor]!;
+      if (compaction.stepIndex >= exclusiveStepIndex) break;
+      this.replayCompactionCursor++;
+      this.bufferedReplayItems.push({
+        type: "compaction",
+        id: `history:${compaction.stepIndex}:compaction`,
+        status: "completed",
+        trigger: overrideTrigger ?? compaction.trigger,
+        ...(compaction.preTokens !== undefined
+          ? { preTokens: compaction.preTokens }
+          : {}),
+        timestamp: compaction.timestamp,
+      });
+    }
   }
 
   private handleMetaSessionUpdate(update: Record<string, unknown>): void {
@@ -1955,10 +2470,17 @@ export class Session {
     );
     this.client = null;
     this.hasDaemonTasks = false;
-    this.subagents?.finish("failed");
     this.cancelPendingPermissions();
+    if (this.activeTurn?.awaitingPromptResponse) {
+      // Let Session.prompt() handle the rejected session/prompt RPC so transient
+      // crashes can auto-rewind and retry before settling the turn.
+      this.activeTurn.activity.resolve();
+      return;
+    }
+    this.subagents?.finish("failed");
     if (this.activeTurn) {
       const turnId = this.activeTurn.id;
+      this.closeOpenCompactionMarker(this.activeTurn);
       this.activeTurn.activity.resolve();
       this.activeTurn.resolve();
       this.activeTurn = null;
@@ -2010,13 +2532,14 @@ export class Session {
   }
 
   private resolveChunkId(kind: string, messageId?: string): string {
+    const scope = this.activeTurn ? this.turnScope(this.activeTurn) : "history";
     if (messageId) {
       this.fallbackChunkIds.delete(kind);
-      return `${this.activeTurn?.id ?? "history"}:${kind}:${messageId}`;
+      return `${scope}:${kind}:${messageId}`;
     }
     let id = this.fallbackChunkIds.get(kind);
     if (!id) {
-      id = `${this.activeTurn?.id ?? "history"}:${kind}:${++this.chunkSequence}`;
+      id = `${scope}:${kind}:${++this.chunkSequence}`;
       this.fallbackChunkIds.set(kind, id);
     }
     return id;
@@ -2167,8 +2690,9 @@ export class Session {
   private emitItem(item: TranscriptTimelineItem): void {
     const { timestamp, ...timelineItem } = item;
     if (timelineItem.type === "tool_call" && this.activeTurn) {
-      timelineItem.id = this.activeTurn.id + ":" + timelineItem.id;
-      timelineItem.callId = this.activeTurn.id + ":" + timelineItem.callId;
+      const scope = this.turnScope(this.activeTurn);
+      timelineItem.id = scope + ":" + timelineItem.id;
+      timelineItem.callId = scope + ":" + timelineItem.callId;
     }
     this.emit({
       type: "timeline.item",
@@ -2178,9 +2702,318 @@ export class Session {
     });
   }
 
+  private turnScope(turn: ActiveTurn): string {
+    return turn.attempt > 0 ? `${turn.id}:r${turn.attempt}` : turn.id;
+  }
+
+  private resetAttemptState(turn: ActiveTurn): void {
+    turn.hasUnrevertableTool = false;
+    turn.hasFileModification = false;
+    turn.heldErrorChunk = undefined;
+    turn.sawInbandError = false;
+    turn.deferredAssistantItems.clear();
+    turn.plan = undefined;
+    this.messages.clear();
+    for (const id of this.toolCalls.keys()) this.retiredToolCalls.add(id);
+    this.toolCalls.clear();
+    this.linkedSubagentCalls.clear();
+    this.fallbackChunkIds.clear();
+  }
+
+  private autoRetryMax(): number {
+    const raw = this.mergedEnv.PASEO_AGY_AUTO_RETRY_MAX;
+    if (raw === undefined || raw.trim() === "") return DEFAULT_AUTO_RETRY_MAX;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_AUTO_RETRY_MAX;
+    return Math.min(Math.trunc(parsed), 10);
+  }
+
+  private autoRetryDelayMs(): number {
+    const raw = this.mergedEnv.PASEO_AGY_AUTO_RETRY_DELAY_MS;
+    if (raw === undefined || raw.trim() === "")
+      return DEFAULT_AUTO_RETRY_DELAY_MS;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0)
+      return DEFAULT_AUTO_RETRY_DELAY_MS;
+    return Math.min(Math.trunc(parsed), 30000);
+  }
+
+  private detectSilentTurnError(
+    attemptStartStepIndex: number,
+  ): AntigravityError | null {
+    if (!this.conversationId) return null;
+    const dbTurnError = readConversationTurnError(
+      this.conversationId,
+      attemptStartStepIndex,
+      this.mergedEnv,
+    );
+    if (dbTurnError) {
+      return new AntigravityError(
+        dbTurnError.userMessage,
+        "EXECUTION_TERMINATED",
+        diagnosticDetails({
+          step: dbTurnError.stepIndex,
+          shortError: dbTurnError.shortError,
+          httpStatus: dbTurnError.httpStatus,
+          details: dbTurnError.details,
+          fullError: dbTurnError.fullError,
+        }),
+        dbTurnError,
+      );
+    }
+    const assistantTexts = [...this.messages.entries()]
+      .filter(([key]) => key.includes(":agent_message_chunk:"))
+      .map(([, value]) => value.trim())
+      .filter((value) => value.length > 0);
+    if (
+      this.toolCalls.size === 0 &&
+      assistantTexts.length > 0 &&
+      assistantTexts.every((value) => value === TERMINATED_ERROR_TEXT)
+    ) {
+      return new AntigravityError(
+        TERMINATED_ERROR_TEXT,
+        "EXECUTION_TERMINATED",
+      );
+    }
+    return null;
+  }
+
+  private async canAutoRetryAttempt(
+    error: unknown,
+    turn: ActiveTurn,
+    revertToken: RevertToken,
+    maxRetries: number,
+  ): Promise<boolean> {
+    if (this.closed || turn.canceled || !this.conversationId) return false;
+    if (turn.attempt >= maxRetries) return false;
+    if (turn.hasUnrevertableTool) return false;
+    if (!hasConversationDb(this.conversationId, this.mergedEnv)) return false;
+    if (!isTransientRetryableError(error)) return false;
+    if (turn.hasFileModification) {
+      try {
+        await this.rewindTracker.assertFileCheckpoint(revertToken);
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private describeRetryReason(error: unknown): string {
+    if (
+      error instanceof AntigravityError &&
+      error.data &&
+      typeof error.data === "object" &&
+      "shortError" in error.data &&
+      typeof error.data.shortError === "string" &&
+      error.data.shortError.trim()
+    ) {
+      return providerError(
+        new AntigravityError(error.data.shortError, error.code),
+      ).message;
+    }
+    return providerError(error).message;
+  }
+
+  private async recycleClientForRetry(client: AcpClient): Promise<void> {
+    if (this.client === client) {
+      this.client = null;
+      this.hasDaemonTasks = false;
+    }
+    if (this.conversationId) {
+      await client
+        .request("session/close", { sessionId: this.conversationId }, 1000)
+        .catch(() => undefined);
+    }
+    await client.close().catch(() => undefined);
+  }
+
+  private classifyAttemptTool(turn: ActiveTurn, tool: AcpToolCallState): void {
+    const name = tool.name ?? "";
+    const rawInput =
+      tool.rawInput &&
+      typeof tool.rawInput === "object" &&
+      !Array.isArray(tool.rawInput)
+        ? tool.rawInput
+        : null;
+    const action =
+      rawInput && typeof rawInput.Action === "string" ? rawInput.Action : "";
+    const isReadOnlyTaskQuery =
+      (name === "manage_task" && (action === "list" || action === "status")) ||
+      (name === "manage_subagents" && action === "list");
+    if (
+      tool.kind === "read" ||
+      tool.kind === "search" ||
+      tool.kind === "think" ||
+      READ_ONLY_TOOL_NAMES.has(name) ||
+      isReadOnlyTaskQuery
+    ) {
+      return;
+    }
+    const modifiedPaths = extractModifiedFilePaths(tool);
+    if (
+      (tool.kind === "edit" || FILE_EDIT_TOOL_NAMES.has(name)) &&
+      modifiedPaths.length > 0
+    ) {
+      turn.hasFileModification = true;
+      return;
+    }
+    turn.hasUnrevertableTool = true;
+  }
+
+  private flushHeldErrorChunk(turn: ActiveTurn | null = this.activeTurn): void {
+    const held = turn?.heldErrorChunk;
+    if (!held || !turn) return;
+    turn.heldErrorChunk = undefined;
+    turn.sawInbandError = false;
+    this.messages.set(held.id, held.text);
+    this.recordOrEmitTimelineItem({
+      type: "assistant_message",
+      id: held.id,
+      messageId: held.id,
+      text: held.text,
+    });
+  }
+
+  private flushDeferredAssistantItems(turn: ActiveTurn): void {
+    for (const item of turn.deferredAssistantItems.values()) {
+      this.recordOrEmitTimelineItem(item);
+    }
+    turn.deferredAssistantItems.clear();
+  }
+
+  private flushNonErrorDeferredAssistantItems(turn: ActiveTurn): void {
+    for (const item of turn.deferredAssistantItems.values()) {
+      if (
+        item.type === "assistant_message" &&
+        item.text.trim() === TERMINATED_ERROR_TEXT
+      ) {
+        continue;
+      }
+      this.recordOrEmitTimelineItem(item);
+    }
+    turn.deferredAssistantItems.clear();
+  }
+
+  private openCompactionMarker(
+    turn: ActiveTurn,
+    id: string,
+    trigger: "auto" | "manual",
+  ): void {
+    if (turn.compactionMarkerOpen) return;
+    turn.compactionMarkerOpen = true;
+    turn.openCompactionId = id;
+    turn.openCompactionTrigger = trigger;
+    this.emitItem({
+      type: "compaction",
+      id,
+      status: "loading",
+      trigger,
+    });
+  }
+
+  private closeOpenCompactionMarker(turn: ActiveTurn): void {
+    if (!turn.compactionMarkerOpen) return;
+    const id =
+      turn.openCompactionId ?? `${this.turnScope(turn)}:compaction:resolved`;
+    const trigger = turn.openCompactionTrigger ?? "auto";
+    turn.compactionMarkerOpen = false;
+    turn.openCompactionId = undefined;
+    turn.openCompactionTrigger = undefined;
+    this.emitItem({
+      type: "compaction",
+      id,
+      status: "completed",
+      trigger,
+    });
+  }
+
+  private async watchLiveCompactions(
+    turn: ActiveTurn,
+    minStepIndex: number,
+    manualCompact: boolean,
+    shouldStop: () => boolean,
+  ): Promise<void> {
+    while (
+      !shouldStop() &&
+      !this.closed &&
+      this.activeTurn === turn &&
+      !turn.canceled
+    ) {
+      await this.syncLiveCompactions(turn, minStepIndex, manualCompact);
+      if (shouldStop() || this.activeTurn !== turn || turn.canceled) return;
+      const activity = turn.activity.promise;
+      await Promise.race([delay(LIVE_COMPACTION_POLL_MS), activity]);
+      if (this.activeTurn === turn && turn.activity.promise === activity) {
+        turn.activity = Promise.withResolvers<void>();
+      }
+    }
+  }
+
+  private async syncLiveCompactions(
+    turn: ActiveTurn,
+    minStepIndex: number,
+    manualCompact: boolean,
+  ): Promise<void> {
+    if (!this.conversationId || this.activeTurn !== turn) return;
+    let steps: TranscriptCompactionStep[];
+    try {
+      steps = await readTranscriptCompactionSteps(
+        this.conversationId,
+        this.mergedEnv,
+        minStepIndex,
+      );
+    } catch {
+      return;
+    }
+    if (this.activeTurn !== turn) return;
+    for (const step of steps) {
+      if (turn.emittedCompactionSteps.has(step.stepIndex)) continue;
+      const id = `history:${step.stepIndex}:compaction`;
+      const trigger = manualCompact ? "manual" : step.trigger;
+      if (step.status === "loading") {
+        this.openCompactionMarker(turn, id, trigger);
+        continue;
+      }
+      turn.emittedCompactionSteps.add(step.stepIndex);
+      turn.compactionMarkerOpen = false;
+      turn.openCompactionId = undefined;
+      turn.openCompactionTrigger = undefined;
+      this.emitItem({
+        type: "compaction",
+        id,
+        status: "completed",
+        trigger,
+        ...(step.preTokens !== undefined ? { preTokens: step.preTokens } : {}),
+        timestamp: step.timestamp,
+      });
+    }
+  }
+
   private emit(event: ProviderEvent): void {
     if (!this.closed) this.options.emit(event);
   }
+}
+
+function isPotentialTerminatedBanner(text: string): boolean {
+  const trimmedStart = text.trimStart();
+  if (trimmedStart.length === 0) return true;
+  if (TERMINATED_ERROR_TEXT.startsWith(trimmedStart)) return true;
+  return trimmedStart.trimEnd() === TERMINATED_ERROR_TEXT;
+}
+
+function isTransientRetryableError(error: unknown): boolean {
+  if (!(error instanceof AntigravityError)) return false;
+  const retryableCode =
+    error.code === "EXECUTION_TERMINATED" ||
+    error.code === "PROCESS_EXITED" ||
+    error.code === "TRANSPORT_ERROR" ||
+    error.code === "RPC_-32603" ||
+    error.code === "RPC_-32000";
+  if (!retryableCode) return false;
+  const haystack = [error.message, error.diagnostic ?? ""].join("\n");
+  if (NON_RETRYABLE_ERROR_PATTERN.test(haystack)) return false;
+  return true;
 }
 
 function toAcpMcpServers(

@@ -3,12 +3,22 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "target": "ES2022",
-    "lib": ["ES2024", "DOM"],
+    "lib": ["ES2024"],
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+    "paths": {
+      "react": ["./types/react.d.ts"],
+      "react/jsx-runtime": ["./types/react-jsx-runtime.d.ts"],
+      "react-native": ["./types/react-native.d.ts"]
+    }
   },
-  "include": ["providers/**/*.ts", "providers/**/*.tsx", "tests/**/*.ts"],
+  "include": [
+    "providers/**/*.ts",
+    "providers/**/*.tsx",
+    "tests/**/*.ts",
+    "types/**/*.d.ts"
+  ],
   "exclude": ["node_modules", "templates", ".backup-original"]
 }
