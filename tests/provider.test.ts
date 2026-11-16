@@ -10,7 +10,10 @@ import type {
   ProviderInput,
 } from "@getpaseo/plugin/server/provider";
 import { createAntigravityProvider } from "../providers/antigravity-provider/server/provider.js";
-import { catalogFromModelOutput } from "../providers/antigravity-provider/server/internal/catalog.js";
+import {
+  catalogFromModelOutput,
+  normalizeSelection,
+} from "../providers/antigravity-provider/server/internal/catalog.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -696,6 +699,128 @@ describe("Antigravity provider public contract", () => {
         .trim()
         .split("\n"),
     ).toHaveLength(1);
+  });
+
+  it("binds duplicate background commands 1-to-1 without thrashing or prematurely completing active calls", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("dup-bg", "background-duplicate-commands");
+    await h.wait(
+      "session.notice",
+      (e) => e.notice.title === "Background task is running",
+    );
+    // Allow multiple 250ms background poll iterations while task-14 is still running.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    const acpToolEvents = (suffix: string) =>
+      h.events
+        .filter((e) => e.type === "timeline.item")
+        .map((e) => e.item)
+        .filter(
+          (item): item is Extract<typeof item, { type: "tool_call" }> =>
+            item.type === "tool_call" && item.callId.endsWith(":" + suffix),
+        );
+
+    // Synchronous foreground command with identical CommandLine is untouched.
+    expect(acpToolEvents("call-sync")).toHaveLength(1);
+    expect(acpToolEvents("call-sync")[0]).toMatchObject({
+      status: "completed",
+      detail: { type: "shell", output: "sync run output" },
+    });
+
+    // Two completed background tasks with identical CommandLine map 1-to-1 and emit once each.
+    expect(acpToolEvents("call-bg-1").map((i) => i.status)).toEqual([
+      "running",
+      "completed",
+    ]);
+    expect(acpToolEvents("call-bg-1").at(-1)).toMatchObject({
+      status: "completed",
+      detail: {
+        type: "shell",
+        exitCode: 0,
+        output: expect.stringContaining("run 1 output"),
+      },
+    });
+
+    expect(acpToolEvents("call-bg-2").map((i) => i.status)).toEqual([
+      "running",
+      "failed",
+    ]);
+    expect(acpToolEvents("call-bg-2").at(-1)).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining("run 2 failed"),
+      detail: { type: "shell", exitCode: 1 },
+    });
+
+    // Killed task-10 completes call-study-1 once, while still-running task-17 keeps call-study-2 running.
+    expect(acpToolEvents("call-study-1").map((i) => i.status)).toEqual([
+      "running",
+      "completed",
+    ]);
+    expect(acpToolEvents("call-study-2").map((i) => i.status)).toEqual([
+      "running",
+    ]);
+
+    // Duplicate schedule prompts also bind 1-to-1 without marking the second active timer completed early.
+    expect(acpToolEvents("call-sched-1").map((i) => i.status)).toEqual([
+      "running",
+      "completed",
+    ]);
+    expect(acpToolEvents("call-sched-2").map((i) => i.status)).toEqual([
+      "running",
+    ]);
+
+    const file = path.join(
+      h.cwd,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      "fixture",
+      ".system_generated",
+      "logs",
+      "transcript_full.jsonl",
+    );
+    const existing = await readFile(file, "utf8");
+    await writeFile(
+      file,
+      existing +
+        [
+          {
+            type: "SYSTEM_MESSAGE",
+            step_index: 20,
+            status: "DONE",
+            content:
+              'Task id "fixture/task-17" finished with result:\nCommand exited with code 0.\nstudy 2 done',
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 21,
+            status: "DONE",
+            content: "ALL_DUPLICATES_DONE",
+          },
+        ]
+          .map((record) => JSON.stringify(record))
+          .join("\n") +
+        "\n",
+    );
+
+    await h.wait("session.turn", (e) => e.state === "completed");
+    expect(acpToolEvents("call-study-2").map((i) => i.status)).toEqual([
+      "running",
+      "completed",
+    ]);
+    expect(acpToolEvents("call-study-2").at(-1)).toMatchObject({
+      status: "completed",
+      detail: {
+        type: "shell",
+        exitCode: 0,
+        output: expect.stringContaining("study 2 done"),
+      },
+    });
+    expect(acpToolEvents("call-sched-2").map((i) => i.status)).toEqual([
+      "running",
+      "completed",
+    ]);
   });
 
   it("passes upstream code and detail to the failed turn and preserves the process for a follow-up", async () => {
@@ -1717,6 +1842,107 @@ describe("Antigravity provider public contract", () => {
       catalog.models[0]?.thinkingOptions?.map((option) => option.id),
     ).toEqual(["medium", "high"]);
   });
+  it("folds Hydrogen xhigh into the model thinking level instead of a separate model", () => {
+    const catalog = catalogFromModelOutput(
+      [
+        "gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)",
+        "gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)",
+        "gemini-4-hydrogen-medium\tGemini 4 Hydrogen (Medium)",
+        "gemini-4-hydrogen-low\tGemini 4 Hydrogen (Low)",
+      ].join("\n"),
+    );
+    expect(catalog.models.map((model) => model.id)).toEqual([
+      "gemini-4-hydrogen",
+    ]);
+    expect(catalog.models[0]).toMatchObject({
+      label: "Gemini 4 Hydrogen",
+      thinkingOptions: [
+        { id: "high", label: "High" },
+        { id: "xhigh", label: "XHigh" },
+        { id: "medium", label: "Medium" },
+        { id: "low", label: "Low" },
+      ],
+    });
+    expect(
+      normalizeSelection(
+        { model: "gemini-4-hydrogen-xhigh", mode: "default" },
+        catalog,
+      ),
+    ).toMatchObject({
+      baseModel: "gemini-4-hydrogen",
+      thinkingOption: "xhigh",
+    });
+  });
+  it("echoes a live prompt from the user chunk that arrives after a model config update", async () => {
+    const h = await harness();
+    await h.open();
+    const before = h.events.length;
+    await h.prompt("echo", "echo-after-config");
+    await h.wait("session.turn", (event) => event.state === "completed");
+    const slice = h.events.slice(before);
+    const configAt = slice.findIndex(
+      (event) => event.type === "session.config",
+    );
+    const userAt = slice.findIndex(
+      (event) =>
+        event.type === "timeline.item" && event.item.type === "user_message",
+    );
+    expect(configAt).toBeGreaterThanOrEqual(0);
+    expect(userAt).toBeGreaterThan(configAt);
+    expect(slice[userAt]).toMatchObject({
+      item: { type: "user_message", text: "echo-after-config" },
+    });
+  });
+  it("opens a selectable question for ask_question and submits the choice as the next prompt", async () => {
+    const h = await harness();
+    await h.open();
+    await h.prompt("ask", "ask-color");
+    const permission = await h.wait(
+      "session.permission",
+      (event) => event.request.kind === "question",
+    );
+    expect(permission.request).toMatchObject({
+      name: "ask_question",
+      title: "Pick a color",
+      input: {
+        questions: [
+          {
+            question: "Pick a color",
+            header: "Response",
+            options: [{ label: "Red" }, { label: "Blue" }],
+            multiSelect: false,
+          },
+        ],
+      },
+    });
+    await h.wait("session.turn", (event) => event.state === "completed");
+    const firstTurnId = h.events.find(
+      (event) => event.type === "session.turn" && event.state === "completed",
+    );
+    await h.connection.send({
+      type: "session.permission",
+      sessionId: "s",
+      permissionId: permission.request.id,
+      response: {
+        behavior: "allow",
+        updatedInput: { answers: { Response: "Red" } },
+      },
+    });
+    await h.wait(
+      "session.turn",
+      (event) =>
+        event.state === "completed" &&
+        event.turnId !==
+          (firstTurnId?.type === "session.turn" ? firstTurnId.turnId : ""),
+    );
+    const answered = h.events
+      .filter((event) => event.type === "timeline.item")
+      .filter((event) => event.item.type === "assistant_message")
+      .map((event) =>
+        event.item.type === "assistant_message" ? event.item.text : "",
+      );
+    expect(answered.some((text) => text.includes("Red"))).toBe(true);
+  });
 
   it("passes --dangerously-skip-permissions in full-access mode and restarts when toggling", async () => {
     const h = await harness();
@@ -1822,7 +2048,7 @@ describe("Antigravity provider public contract", () => {
     ).toHaveLength(1);
   });
 
-  it("automatically rewinds SQLite history, recycles ACP, and retries transient silent errors", async () => {
+  it("continues a transient silent error without rewinding the conversation", async () => {
     const h = await harness({
       FIXTURE_DB: "1",
       PASEO_AGY_AUTO_RETRY_DELAY_MS: "10",
@@ -1839,7 +2065,16 @@ describe("Antigravity provider public contract", () => {
     expect(assistantTexts).not.toContain(
       "Agent execution terminated due to error.",
     );
-    expect(assistantTexts.at(-1)).toBe("RECOVERED_AFTER_REWIND(stepsBefore=0)");
+    expect(assistantTexts.at(-1)).toMatch(
+      /^RECOVERED_AFTER_CONTINUE\(stepsBefore=[1-9]\d*\)$/,
+    );
+    const continued = h.events
+      .filter((event) => event.type === "timeline.item")
+      .filter((event) => event.item.type === "user_message")
+      .map((event) =>
+        event.item.type === "user_message" ? event.item.text : "",
+      );
+    expect(continued).toContain("继续");
 
     const turns = h.events
       .filter((event) => event.type === "session.turn")
@@ -1857,11 +2092,10 @@ describe("Antigravity provider public contract", () => {
     )
       .trim()
       .split("\n");
-    expect(pids).toHaveLength(2);
-    expect(pids[0]).not.toBe(pids[1]);
+    expect(pids).toHaveLength(1);
   });
 
-  it("reverts tracked file modifications before retrying a failed transient turn", async () => {
+  it("continues after a partial edit without reverting the file", async () => {
     const h = await harness({
       FIXTURE_DB: "1",
       PASEO_AGY_AUTO_RETRY_DELAY_MS: "10",
@@ -1884,35 +2118,60 @@ describe("Antigravity provider public contract", () => {
       .flatMap((event) =>
         event.item.type === "assistant_message" ? [event.item.text] : [],
       );
-    expect(assistantTexts.at(-1)).toBe(
-      "RECOVERED_AFTER_REWIND(stepsBefore=0:clean-before)",
+    expect(assistantTexts.at(-1)).toMatch(
+      /^RECOVERED_AFTER_CONTINUE\(stepsBefore=[1-9]\d*:corrupted-partial-edit\)$/,
     );
-    expect(await readFile(target, "utf8")).toBe("clean-before");
+    expect(await readFile(target, "utf8")).toBe("corrupted-partial-edit");
   });
 
-  it("does not auto-retry non-transient errors or turns after shell side effects", async () => {
-    for (const [promptText, expectedDetail] of [
-      ["nonretryable-silent-error", "credits balance is too low"],
-      ["shell-then-silent-error", "User location is not supported"],
-    ] as const) {
-      const h = await harness({
-        FIXTURE_DB: "1",
-        PASEO_AGY_AUTO_RETRY_DELAY_MS: "10",
-      });
-      await h.open();
-      await h.prompt("m1", promptText);
-      const failed = await h.wait(
-        "session.turn",
-        (event) => event.state === "failed",
+  it("does not auto-retry a non-transient billing error", async () => {
+    const h = await harness({
+      FIXTURE_DB: "1",
+      PASEO_AGY_AUTO_RETRY_DELAY_MS: "10",
+    });
+    await h.open();
+    await h.prompt("m1", "nonretryable-silent-error");
+    const failed = await h.wait(
+      "session.turn",
+      (event) => event.state === "failed",
+    );
+    expect(failed.error?.diagnostic).toContain("credits balance is too low");
+    const attempts = (
+      await readFile(path.join(h.cwd, "retry-attempts.txt"), "utf8")
+    )
+      .trim()
+      .split("\n");
+    expect(attempts).toHaveLength(1);
+  });
+
+  it("continues after a shell side effect without repeating the command", async () => {
+    const h = await harness({
+      FIXTURE_DB: "1",
+      PASEO_AGY_AUTO_RETRY_DELAY_MS: "10",
+    });
+    await h.open();
+    await h.prompt("m1", "shell-then-silent-error");
+    await h.wait("session.turn", (event) => event.state === "completed");
+    const shellCalls = h.events
+      .filter((event) => event.type === "timeline.item")
+      .filter(
+        (event) =>
+          event.item.type === "tool_call" && event.item.name === "run_command",
       );
-      expect(failed.error?.diagnostic).toContain(expectedDetail);
-      const attempts = (
-        await readFile(path.join(h.cwd, "retry-attempts.txt"), "utf8")
-      )
-        .trim()
-        .split("\n");
-      expect(attempts).toHaveLength(1);
-    }
+    const shellIds = new Set(
+      shellCalls.flatMap((event) =>
+        event.item.type === "tool_call" ? [event.item.callId] : [],
+      ),
+    );
+    expect(shellIds.size).toBe(1);
+    const assistantTexts = h.events
+      .filter((event) => event.type === "timeline.item")
+      .flatMap((event) =>
+        event.item.type === "assistant_message" ? [event.item.text] : [],
+      );
+    expect(assistantTexts.at(-1)).toMatch(
+      /^RECOVERED_AFTER_CONTINUE\(stepsBefore=[1-9]/,
+    );
   });
 
   it("emits loading and completed compaction items for manual /compact and auto-compaction turns", async () => {

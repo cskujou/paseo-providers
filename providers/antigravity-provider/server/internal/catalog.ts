@@ -234,7 +234,7 @@ export function normalizeSelection(
   let thinkingOption =
     config.thinkingOption === "auto" ? undefined : config.thinkingOption;
   if (!catalog.models.some((model) => model.id === baseModel)) {
-    const legacy = /^(.*)-(low|medium|high|thinking)$/.exec(baseModel);
+    const legacy = /^(.*)-(low|medium|high|xhigh|thinking)$/.exec(baseModel);
     if (legacy && catalog.models.some((model) => model.id === legacy[1])) {
       baseModel = legacy[1]!;
       thinkingOption ??= legacy[2] === "thinking" ? "high" : legacy[2];
@@ -298,19 +298,25 @@ export function catalogFromModelOutput(stdout: string): ProviderCatalog {
     const match = /^([\w.-]+)[ \t]+(.+?)\s*$/.exec(stripAnsi(line).trim());
     if (!match) continue;
     const rawId = match[1]!;
-    const variant = /^(gemini-.+|claude-.+)-(low|medium|high)$/.exec(rawId);
+    const variant = /^(gemini-.+|claude-.+)-(low|medium|high|xhigh)$/.exec(
+      rawId,
+    );
     const id = variant?.[1] ?? rawId;
+    const paren = variant ? /\s*\(([^)]+)\)$/.exec(match[2]!) : null;
     let model = models.get(id);
     if (!model) {
       model = {
         id,
-        label: match[2]!.replace(/\s*\((Low|Medium|High)\)$/, ""),
+        label: paren ? match[2]!.slice(0, paren.index).trimEnd() : match[2]!,
         thinkingOptions: [],
       };
       models.set(id, model);
     }
     if (variant) {
-      model.thinkingOptions!.push({ id: variant[2]!, label: variant[2]! });
+      model.thinkingOptions!.push({
+        id: variant[2]!,
+        label: paren?.[1] ?? variant[2]!,
+      });
       model.defaultThinkingOptionId ??= variant[2];
     }
   }

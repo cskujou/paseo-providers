@@ -161,7 +161,9 @@ describe("compiled provider through the real Paseo host", () => {
   }, 20000);
   it("auto-rewinds transient execution errors and forwards compaction timeline events through the host", async () => {
     expect(await run("retry-and-compaction")).toEqual({
-      retryFinalText: "RECOVERED_AFTER_REWIND(stepsBefore=0)",
+      retryFinalText: expect.stringMatching(
+        /^RECOVERED_AFTER_CONTINUE\(stepsBefore=[1-9]/,
+      ),
       autoFinalText: "Auto compact turn complete.",
       manualFinalText: "Manual compact complete.",
       assistantLeakedError: false,

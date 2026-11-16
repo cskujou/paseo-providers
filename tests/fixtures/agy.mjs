@@ -477,6 +477,235 @@ input.on("line", (line) => {
           );
         break;
       }
+      if (text === "background-duplicate-commands") {
+        const logs = path.join(
+          process.env.HOME,
+          ".gemini",
+          "antigravity-cli",
+          "brain",
+          "fixture",
+          ".system_generated",
+          "logs",
+        );
+        mkdirSync(logs, { recursive: true });
+        const file = path.join(logs, "transcript_full.jsonl");
+        const verifyArgs = { CommandLine: "python verify_value.py" };
+        const studyArgs = { CommandLine: "python study_layer.py" };
+        const schedArgs = {
+          DurationSeconds: 60,
+          Prompt: "Check progress",
+          TimerCondition: "any",
+        };
+        const records = [
+          {
+            type: "USER_INPUT",
+            step_index: 0,
+            content: "background-duplicate-commands",
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 1,
+            status: "DONE",
+            tool_calls: [{ name: "run_command", args: verifyArgs }],
+          },
+          {
+            type: "GENERIC",
+            step_index: 2,
+            status: "DONE",
+            content: "sync run output",
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 3,
+            status: "DONE",
+            tool_calls: [{ name: "run_command", args: verifyArgs }],
+          },
+          {
+            type: "GENERIC",
+            step_index: 4,
+            status: "RUNNING",
+            content:
+              "Tool is running as a background task with task id: fixture/task-4\nTask Description: python verify_value.py",
+          },
+          {
+            type: "SYSTEM_MESSAGE",
+            step_index: 5,
+            status: "DONE",
+            content:
+              'Task id "fixture/task-4" finished with result:\nCommand exited with code 0.\nrun 1 output',
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 6,
+            status: "DONE",
+            tool_calls: [{ name: "run_command", args: verifyArgs }],
+          },
+          {
+            type: "GENERIC",
+            step_index: 7,
+            status: "RUNNING",
+            content:
+              "Tool is running as a background task with task id: fixture/task-7\nTask Description: python verify_value.py",
+          },
+          {
+            type: "SYSTEM_MESSAGE",
+            step_index: 8,
+            status: "DONE",
+            content:
+              'Task id "fixture/task-7" finished with result:\nCommand exited with code 1.\nrun 2 failed',
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 9,
+            status: "DONE",
+            tool_calls: [{ name: "run_command", args: studyArgs }],
+          },
+          {
+            type: "GENERIC",
+            step_index: 10,
+            status: "RUNNING",
+            content:
+              "Tool is running as a background task with task id: fixture/task-10\nTask Description: python study_layer.py",
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 11,
+            status: "DONE",
+            tool_calls: [
+              {
+                name: "manage_task",
+                args: { Action: "kill", TaskId: "fixture/task-10" },
+              },
+            ],
+          },
+          {
+            type: "GENERIC",
+            step_index: 12,
+            status: "DONE",
+            content: "Killed task fixture/task-10",
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 13,
+            status: "DONE",
+            tool_calls: [{ name: "schedule", args: schedArgs }],
+          },
+          {
+            type: "GENERIC",
+            step_index: 14,
+            status: "RUNNING",
+            content:
+              "Tool is running as a background task with task id: fixture/task-14\nTask Description: Timer: 1m, Prompt: Check progress",
+          },
+          {
+            type: "SYSTEM_MESSAGE",
+            step_index: 15,
+            status: "DONE",
+            content:
+              "[Message] timestamp=2026-11-14T10:00:00Z sender=fixture/task-14 priority=MESSAGE_PRIORITY_HIGH content=Check progress (1)",
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 16,
+            status: "DONE",
+            tool_calls: [
+              { name: "run_command", args: studyArgs },
+              { name: "schedule", args: schedArgs },
+            ],
+          },
+          {
+            type: "GENERIC",
+            step_index: 17,
+            status: "RUNNING",
+            content:
+              "Tool is running as a background task with task id: fixture/task-17\nTask Description: python study_layer.py",
+          },
+          {
+            type: "GENERIC",
+            step_index: 18,
+            status: "RUNNING",
+            content:
+              "Tool is running as a background task with task id: fixture/task-18\nTask Description: Timer: 1m, Prompt: Check progress",
+          },
+          {
+            type: "PLANNER_RESPONSE",
+            step_index: 19,
+            status: "DONE",
+            content: "waiting on study 2",
+          },
+        ];
+        writeFileSync(
+          file,
+          records.map((r) => JSON.stringify(r)).join("\n") + "\n",
+        );
+        send(
+          update("tool_call", {
+            toolCallId: "call-sync",
+            name: "run_command",
+            kind: "execute",
+            status: "completed",
+            rawInput: verifyArgs,
+            rawOutput: "sync run output",
+          }),
+        );
+        send(
+          update("tool_call", {
+            toolCallId: "call-bg-1",
+            name: "run_command",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: verifyArgs,
+          }),
+        );
+        send(
+          update("tool_call", {
+            toolCallId: "call-bg-2",
+            name: "run_command",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: verifyArgs,
+          }),
+        );
+        send(
+          update("tool_call", {
+            toolCallId: "call-study-1",
+            name: "run_command",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: studyArgs,
+          }),
+        );
+        send(
+          update("tool_call", {
+            toolCallId: "call-sched-1",
+            name: "schedule",
+            kind: "other",
+            status: "in_progress",
+            rawInput: schedArgs,
+          }),
+        );
+        send(
+          update("tool_call", {
+            toolCallId: "call-study-2",
+            name: "run_command",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: studyArgs,
+          }),
+        );
+        send(
+          update("tool_call", {
+            toolCallId: "call-sched-2",
+            name: "schedule",
+            kind: "other",
+            status: "in_progress",
+            rawInput: schedArgs,
+          }),
+        );
+        send(chunk("agent_message_chunk", "waiting on study 2"));
+        reply(f, { stopReason: "end_turn" });
+        break;
+      }
       if (text === "plan-proposal" || text === "ordinary-artifact") {
         const file = path.join(
           process.env.HOME,
@@ -690,6 +919,26 @@ input.on("line", (line) => {
         }, 80);
         break;
       }
+      if (text === "继续") {
+        const db = openFixtureDb();
+        const existingStepCount = Number(
+          db.prepare("SELECT COUNT(*) AS count FROM steps").get().count ?? 0,
+        );
+        insertDbStep(db, 15, 3);
+        db.close();
+        const editedPath = path.join(process.cwd(), "edited.txt");
+        const editedCheck = existsSync(editedPath)
+          ? ":" + readFileSync(editedPath, "utf8")
+          : "";
+        send(
+          chunk(
+            "agent_message_chunk",
+            `RECOVERED_AFTER_CONTINUE(stepsBefore=${existingStepCount}${editedCheck})`,
+          ),
+        );
+        reply(f, { stopReason: "end_turn" });
+        break;
+      }
       if (
         text === "transient-silent-error" ||
         text === "nonretryable-silent-error" ||
@@ -744,11 +993,7 @@ input.on("line", (line) => {
             }),
           );
         }
-        if (
-          previousAttempts === 0 ||
-          text === "nonretryable-silent-error" ||
-          text === "shell-then-silent-error"
-        ) {
+        if (previousAttempts === 0 || text === "nonretryable-silent-error") {
           const shortError =
             text === "nonretryable-silent-error"
               ? "Your AI credits balance is too low to continue."
@@ -779,7 +1024,7 @@ input.on("line", (line) => {
         send(
           chunk(
             "agent_message_chunk",
-            `RECOVERED_AFTER_REWIND(stepsBefore=${existingStepCount}${editedCheck})`,
+            `RECOVERED_AFTER_CONTINUE(stepsBefore=${existingStepCount}${editedCheck})`,
           ),
         );
         reply(f, { stopReason: "end_turn" });
@@ -918,6 +1163,52 @@ input.on("line", (line) => {
             options,
           },
         });
+        break;
+      }
+      if (text === "echo-after-config") {
+        send(
+          update("config_option_update", {
+            configOptions: options(),
+          }),
+        );
+        send(chunk("user_message_chunk", text));
+        send(chunk("agent_message_chunk", "ECHO_OK"));
+        reply(f, { stopReason: "end_turn" });
+        break;
+      }
+      if (text === "ask-color") {
+        send(chunk("user_message_chunk", text));
+        send(
+          update("tool_call", {
+            toolCallId: "ask-1",
+            name: "ask_question",
+            kind: "other",
+            title: "Run ask_question",
+            status: "pending",
+            rawInput: {
+              questions: [
+                {
+                  question: "Pick a color",
+                  options: ["Red", "Blue"],
+                  is_multi_select: false,
+                },
+              ],
+            },
+          }),
+        );
+        send(
+          chunk(
+            "agent_message_chunk",
+            "\nPick a color\n- [1] Red\n- [2] Blue\n",
+          ),
+        );
+        send(
+          update("tool_call_update", {
+            toolCallId: "ask-1",
+            status: "completed",
+          }),
+        );
+        reply(f, { stopReason: "end_turn" });
         break;
       }
       send(chunk("agent_message_chunk", JSON.stringify(f.params.prompt)));

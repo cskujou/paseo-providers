@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   inspectTurnExecutionFailure,
   readBackgroundTurn,
+  type BackgroundTask,
 } from "./background.js";
 import { planFromTool, readPendingPlan, type PlanProposal } from "./plan.js";
 import { SubagentTracker } from "./subagents.js";
@@ -52,7 +53,6 @@ import {
 import {
   RevertTokenSchema,
   SessionRewindTracker,
-  hasConversationDb,
   readConversationTurnError,
   readUserStepIndices,
   type RevertToken,
@@ -78,6 +78,7 @@ const INBAND_EXECUTION_ERROR_RE =
   /^(?:⚠\s*)?Agent execution terminated due to error\.?$/u;
 const DEFAULT_AUTO_RETRY_MAX = 3;
 const DEFAULT_AUTO_RETRY_DELAY_MS = 600;
+const TRANSIENT_CONTINUE_PROMPT = "继续";
 const LIVE_COMPACTION_POLL_MS = 300;
 
 const READ_ONLY_TOOL_NAMES = new Set([
@@ -181,11 +182,20 @@ interface ActiveTurn {
   canceled: boolean;
   sawInbandError?: boolean;
   heldErrorChunk?: { id: string; text: string };
+  clientMessageId: string;
+  promptText: string;
+  revertToken: RevertToken;
+  userEchoed: boolean;
+  userEchoText: string;
   completion: Promise<void>;
   resolve(): void;
   activity: ReturnType<typeof Promise.withResolvers<void>>;
   backgroundPhase?: string;
   backgroundAfterStep?: number;
+  backgroundProjectedRevision?: string;
+  backgroundTaskToolCalls: Map<string, string>;
+  claimedBackgroundToolCalls: Set<string>;
+  publishedBackgroundItems: Map<string, string>;
   plan?: PlanProposal;
 }
 
@@ -217,6 +227,10 @@ export class Session {
   private readonly mergedEnv: Record<string, string>;
   private readonly rewindTracker: SessionRewindTracker;
   private activeTurn: ActiveTurn | null = null;
+  private readonly askQuestions = new Map<
+    string,
+    { permissionId: string; questions: AskQuestion[] }
+  >();
   private readonly toolCalls = new Map<string, AcpToolCallState>();
   private readonly retiredToolCalls = new Set<string>();
   private readonly messages = new Map<string, string>();
@@ -427,10 +441,18 @@ export class Session {
         emittedCompactionSteps: new Set(),
         retried: false,
         canceled: false,
+        clientMessageId: prompt.clientMessageId,
+        promptText: displayText,
+        revertToken,
+        userEchoed: false,
+        userEchoText: "",
         completion: completion.promise,
         resolve: completion.resolve,
         activity: Promise.withResolvers<void>(),
         backgroundAfterStep: previousBackground?.lastStep,
+        backgroundTaskToolCalls: new Map(),
+        claimedBackgroundToolCalls: new Set(),
+        publishedBackgroundItems: new Map(),
       };
       this.activeTurn = turn;
       logDiagnostic("turn.started", {
@@ -454,17 +476,10 @@ export class Session {
         turnId: turn.id,
         state: "started",
       });
-      this.emitItem({
-        type: "user_message",
-        id: prompt.clientMessageId,
-        messageId: prompt.clientMessageId,
-        clientMessageId: prompt.clientMessageId,
-        text: displayText,
-        revertToken,
-      });
       let completed = false;
       const maxRetries = this.autoRetryMax();
       const baseRetryDelayMs = this.autoRetryDelayMs();
+      let promptBlocks = acpPrompt;
       try {
         let canceled = false;
         while (true) {
@@ -497,7 +512,7 @@ export class Session {
               .parse(
                 await client.request(
                   "session/prompt",
-                  { sessionId: this.conversationId, prompt: acpPrompt },
+                  { sessionId: this.conversationId, prompt: promptBlocks },
                   null,
                 ),
               );
@@ -577,14 +592,9 @@ export class Session {
                         this.conversationId,
                         prompt.clientMessageId,
                       );
-                      this.emitItem({
-                        type: "user_message",
-                        id: prompt.clientMessageId,
-                        messageId: prompt.clientMessageId,
-                        clientMessageId: prompt.clientMessageId,
-                        text: displayText,
-                        revertToken,
-                      });
+                      turn.revertToken = revertToken;
+                      turn.userEchoed = false;
+                      turn.userEchoText = "";
                     }
                     this.fallbackChunkIds.clear();
                     turn.attempt += 1;
@@ -611,12 +621,14 @@ export class Session {
               this.flushHeldErrorChunk(turn);
               this.flushDeferredAssistantItems(turn);
               this.closeOpenCompactionMarker(turn);
+              this.ensurePromptEcho(turn);
               await this.waitForBackgroundTurn(turn);
               await this.waitForTurnTools(turn);
               await this.waitForSubagents(turn);
             } else {
               this.closeOpenCompactionMarker(turn);
             }
+            this.ensurePromptEcho(turn);
             break;
           } catch (attemptError) {
             turn.awaitingPromptResponse = false;
@@ -628,12 +640,7 @@ export class Session {
             }
             if (this.activeTurn !== turn) return;
             if (
-              !(await this.canAutoRetryAttempt(
-                attemptError,
-                turn,
-                revertToken,
-                maxRetries,
-              ))
+              !this.canAutoRetryAttempt(attemptError, turn, maxRetries)
             ) {
               this.flushNonErrorDeferredAssistantItems(turn);
               this.closeOpenCompactionMarker(turn);
@@ -663,11 +670,10 @@ export class Session {
               notice: {
                 id: "auto-retry:" + turn.id,
                 severity: "warning",
-                title: `Transient Antigravity error; rewinding and retrying (${nextAttempt}/${maxRetries})`,
+                title: `Transient Antigravity error; continuing (${nextAttempt}/${maxRetries})`,
                 description: retrySummary,
               },
             });
-            await this.recycleClientForRetry(client);
             if (this.activeTurn !== turn) return;
             if (turn.canceled || this.closed) {
               canceled = true;
@@ -683,28 +689,13 @@ export class Session {
               canceled = true;
               break;
             }
-            if (turn.hasFileModification) {
-              await this.rewindTracker.revertFiles(revertToken);
-            }
-            await this.rewindTracker.revertAttemptConversation(
-              this.conversationId,
-              revertToken,
-            );
-            revertToken = await this.rewindTracker.createTurnToken(
-              this.conversationId,
-              prompt.clientMessageId,
-            );
-            this.emitItem({
-              type: "user_message",
-              id: prompt.clientMessageId,
-              messageId: prompt.clientMessageId,
-              clientMessageId: prompt.clientMessageId,
-              text: displayText,
-              revertToken,
-            });
+            promptBlocks = [{ type: "text", text: TRANSIENT_CONTINUE_PROMPT }];
+            turn.clientMessageId = `${prompt.clientMessageId}:continue:${nextAttempt}`;
+            turn.promptText = TRANSIENT_CONTINUE_PROMPT;
+            turn.userEchoed = false;
+            turn.userEchoText = "";
             turn.attempt = nextAttempt;
             this.resetAttemptState(turn);
-            client = await this.startAcpClient("skip");
             if (this.activeTurn !== turn) return;
             if (turn.canceled || this.closed) {
               canceled = true;
@@ -751,6 +742,7 @@ export class Session {
           },
           error,
         );
+        this.ensurePromptEcho(turn);
         this.emit({
           type: "session.turn",
           sessionId: this.options.id,
@@ -815,8 +807,7 @@ export class Session {
           snapshot.userStep <= turn.backgroundAfterStep))
     )
       return false;
-    const published = new Map<string, string>();
-    let projectedRevision: string | undefined;
+    const published = turn.publishedBackgroundItems;
     let observation: string | undefined;
     let transcriptAvailable = true;
     const noticeId = "background:" + turn.id;
@@ -870,50 +861,37 @@ export class Session {
           },
         });
       }
+      this.bindBackgroundTaskToolCalls(turn, snapshot.tasks);
       for (const task of snapshot.tasks) {
         if (task.kind === "subagent" || (!task.completed && !task.daemon))
           continue;
-        for (const [id, state] of this.toolCalls) {
-          const input = state.rawInput;
-          const matchesRunCommand =
-            task.toolName !== "schedule" &&
-            state.name === "run_command" &&
-            input &&
-            typeof input === "object" &&
-            !Array.isArray(input) &&
-            input.CommandLine === task.command;
-          const matchesSchedule =
-            task.toolName === "schedule" &&
-            state.name === "schedule" &&
-            input &&
-            typeof input === "object" &&
-            !Array.isArray(input) &&
-            (input.Prompt === task.prompt || input.Prompt === task.command);
-          if (!matchesRunCommand && !matchesSchedule) continue;
-          const next = {
-            ...state,
-            status:
-              task.exitCode !== undefined && task.exitCode !== 0
-                ? ("failed" as const)
-                : ("completed" as const),
-            rawOutput: task.output,
-          };
-          const item = acpToolToTimelineItem(next);
-          if (item.detail.type === "shell")
-            item.detail = { ...item.detail, exitCode: task.exitCode };
-          const fingerprint = JSON.stringify(item);
-          if (published.get("acp:" + id) !== fingerprint) {
-            published.set("acp:" + id, fingerprint);
-            this.toolCalls.set(id, next);
-            this.emitItem(item);
-          }
+        const id = turn.backgroundTaskToolCalls.get(task.id);
+        if (!id) continue;
+        const state = this.toolCalls.get(id);
+        if (!state) continue;
+        const next = {
+          ...state,
+          status:
+            task.exitCode !== undefined && task.exitCode !== 0
+              ? ("failed" as const)
+              : ("completed" as const),
+          rawOutput: task.output,
+        };
+        const item = acpToolToTimelineItem(next);
+        if (item.detail.type === "shell")
+          item.detail = { ...item.detail, exitCode: task.exitCode };
+        const fingerprint = JSON.stringify(item);
+        if (published.get("acp:" + id) !== fingerprint) {
+          published.set("acp:" + id, fingerprint);
+          this.toolCalls.set(id, next);
+          this.emitItem(item);
         }
       }
       // ACP can go silent after its foreground response while AGY continues.
       // Send new and changed transcript items immediately, not only at final settlement.
       if (
         snapshot.continuationStep !== undefined &&
-        snapshot.continuationRevision !== projectedRevision
+        snapshot.continuationRevision !== turn.backgroundProjectedRevision
       ) {
         const items = await readTranscriptTimeline(
           this.conversationId,
@@ -921,7 +899,7 @@ export class Session {
           true,
         );
         if (this.activeTurn !== turn || turn.canceled) return true;
-        projectedRevision = snapshot.continuationRevision;
+        turn.backgroundProjectedRevision = snapshot.continuationRevision;
         let updated = 0;
         for (const item of items) {
           const step = /^history:(\d+):/.exec(item.id);
@@ -1009,6 +987,39 @@ export class Session {
       }
     }
     return true;
+  }
+
+  private bindBackgroundTaskToolCalls(
+    turn: ActiveTurn,
+    tasks: BackgroundTask[],
+  ): void {
+    const commandTasks = tasks.filter((task) => task.kind !== "subagent");
+    for (const task of commandTasks) {
+      if (turn.backgroundTaskToolCalls.has(task.id)) continue;
+      for (const [id, state] of this.toolCalls) {
+        if (turn.claimedBackgroundToolCalls.has(id)) continue;
+        if (!matchesBackgroundTaskTool(task, state)) continue;
+        if (extractBackgroundTaskId(state) === task.id) {
+          turn.backgroundTaskToolCalls.set(task.id, id);
+          turn.claimedBackgroundToolCalls.add(id);
+          break;
+        }
+      }
+    }
+    for (const task of commandTasks) {
+      if (turn.backgroundTaskToolCalls.has(task.id)) continue;
+      for (const [id, state] of this.toolCalls) {
+        if (turn.claimedBackgroundToolCalls.has(id)) continue;
+        if (state.status !== "pending" && state.status !== "in_progress")
+          continue;
+        const explicitTaskId = extractBackgroundTaskId(state);
+        if (explicitTaskId && explicitTaskId !== task.id) continue;
+        if (!matchesBackgroundTaskTool(task, state)) continue;
+        turn.backgroundTaskToolCalls.set(task.id, id);
+        turn.claimedBackgroundToolCalls.add(id);
+        break;
+      }
+    }
   }
 
   private subagentTracker(): SubagentTracker {
@@ -1294,6 +1305,46 @@ export class Session {
     permissionId: string,
     response: ProviderPermissionResponse,
   ): Promise<void> {
+    const asked = [...this.askQuestions.entries()].find(
+      ([, question]) => question.permissionId === permissionId,
+    );
+    if (asked) {
+      const [toolCallId, question] = asked;
+      this.askQuestions.delete(toolCallId);
+      this.emit({
+        type: "session.permission_resolved",
+        sessionId: this.options.id,
+        permissionId,
+      });
+      const text = askAnswerText(response, question.questions);
+      if (!text) return;
+      const turn = this.activeTurn;
+      void (turn ? turn.completion : Promise.resolve())
+        .then(() => {
+          if (this.closed) return;
+          return this.prompt({
+            clientMessageId: randomUUID(),
+            delivery: "auto",
+            input: {
+              type: "message",
+              content: [{ type: "text", text }],
+            },
+          });
+        })
+        .catch((error: unknown) => {
+          logDiagnostic(
+            "ask_question.answer_failed",
+            { sessionId: this.options.id, conversationId: this.conversationId },
+            error,
+          );
+          this.emit({
+            type: "session.runtime_failed",
+            sessionId: this.options.id,
+            error: providerError(error),
+          });
+        });
+      return;
+    }
     const approval = this.planApproval;
     if (approval?.id === permissionId) {
       const expected = response.behavior === "allow" ? "implement" : "dismiss";
@@ -1955,7 +2006,7 @@ export class Session {
 
     if (kind === "user_message_chunk") {
       if (this.replayMode !== "replay") {
-        this.fallbackChunkIds.clear();
+        this.echoLiveUserChunk(update);
         return;
       }
       this.fallbackChunkIds.delete("agent_message_chunk");
@@ -2102,6 +2153,12 @@ export class Session {
         this.classifyAttemptTool(this.activeTurn, merged);
       }
       this.toolCalls.set(merged.toolCallId, merged);
+      if (
+        merged.name === "ask_question" &&
+        this.replayMode === "none" &&
+        this.activeTurn
+      )
+        this.openAskQuestion(merged);
       if (this.activeTurn && this.config.mode === "plan" && this.conversationId)
         this.activeTurn.plan =
           planFromTool(merged, this.conversationId, this.mergedEnv) ??
@@ -2531,6 +2588,63 @@ export class Session {
     }
   }
 
+  private ensurePromptEcho(turn: ActiveTurn): void {
+    if (turn.userEchoed || !turn.promptText) return;
+    this.emitPromptEcho(turn, turn.promptText);
+  }
+
+  private emitPromptEcho(turn: ActiveTurn, text: string): void {
+    if (!text) return;
+    turn.userEchoed = true;
+    turn.userEchoText = text;
+    this.emitItem({
+      type: "user_message",
+      id: turn.clientMessageId,
+      messageId: turn.clientMessageId,
+      clientMessageId: turn.clientMessageId,
+      text,
+      revertToken: turn.revertToken,
+    });
+  }
+
+  private echoLiveUserChunk(update: Record<string, unknown>): void {
+    const turn = this.activeTurn;
+    if (!turn || this.replayMode === "replay") return;
+    const content =
+      typeof update.content === "object" && update.content !== null
+        ? (update.content as Record<string, unknown>)
+        : {};
+    if (content.type !== "text" || typeof content.text !== "string") return;
+    this.emitPromptEcho(turn, `${turn.userEchoText}${content.text}`);
+  }
+
+  private openAskQuestion(tool: AcpToolCallState): void {
+    if (this.askQuestions.has(tool.toolCallId)) return;
+    const questions = parseAskQuestions(tool.rawInput);
+    if (!questions.length) return;
+    const permissionId = "ask:" + tool.toolCallId;
+    this.askQuestions.set(tool.toolCallId, { permissionId, questions });
+    this.emit({
+      type: "session.permission",
+      sessionId: this.options.id,
+      request: {
+        id: permissionId,
+        name: "ask_question",
+        kind: "question",
+        title: questions.length === 1 ? questions[0]!.question : "Question",
+        input: {
+          questions: questions.map((question, index) => ({
+            question: question.question,
+            header:
+              questions.length === 1 ? "Response" : `Question ${index + 1}`,
+            options: question.options.map((label) => ({ label })),
+            multiSelect: question.isMultiSelect,
+          })),
+        },
+      },
+    });
+  }
+
   private resolveChunkId(kind: string, messageId?: string): string {
     const scope = this.activeTurn ? this.turnScope(this.activeTurn) : "history";
     if (messageId) {
@@ -2712,6 +2826,10 @@ export class Session {
     turn.heldErrorChunk = undefined;
     turn.sawInbandError = false;
     turn.deferredAssistantItems.clear();
+    turn.backgroundProjectedRevision = undefined;
+    turn.backgroundTaskToolCalls.clear();
+    turn.claimedBackgroundToolCalls.clear();
+    turn.publishedBackgroundItems.clear();
     turn.plan = undefined;
     this.messages.clear();
     for (const id of this.toolCalls.keys()) this.retiredToolCalls.add(id);
@@ -2778,25 +2896,18 @@ export class Session {
     return null;
   }
 
-  private async canAutoRetryAttempt(
+  private canAutoRetryAttempt(
     error: unknown,
     turn: ActiveTurn,
-    revertToken: RevertToken,
     maxRetries: number,
-  ): Promise<boolean> {
+  ): boolean {
     if (this.closed || turn.canceled || !this.conversationId) return false;
     if (turn.attempt >= maxRetries) return false;
-    if (turn.hasUnrevertableTool) return false;
-    if (!hasConversationDb(this.conversationId, this.mergedEnv)) return false;
-    if (!isTransientRetryableError(error)) return false;
-    if (turn.hasFileModification) {
-      try {
-        await this.rewindTracker.assertFileCheckpoint(revertToken);
-      } catch {
-        return false;
-      }
-    }
-    return true;
+    return (
+      error instanceof AntigravityError &&
+      error.code === "EXECUTION_TERMINATED" &&
+      isTransientRetryableError(error)
+    );
   }
 
   private describeRetryReason(error: unknown): string {
@@ -2995,6 +3106,65 @@ export class Session {
   }
 }
 
+interface AskQuestion {
+  question: string;
+  options: string[];
+  isMultiSelect: boolean;
+}
+
+function parseAskQuestions(raw: JsonValue): AskQuestion[] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const list = raw.questions;
+  if (!Array.isArray(list)) return [];
+  const questions: AskQuestion[] = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const question = item.question;
+    const options = item.options;
+    if (
+      typeof question !== "string" ||
+      !question.trim() ||
+      !Array.isArray(options)
+    )
+      continue;
+    const labels = options.filter(
+      (option): option is string =>
+        typeof option === "string" && option.length > 0,
+    );
+    if (labels.length < 2) continue;
+    questions.push({
+      question: question.trim(),
+      options: labels,
+      isMultiSelect: item.is_multi_select === true,
+    });
+  }
+  return questions;
+}
+
+function askAnswerText(
+  response: ProviderPermissionResponse,
+  questions: AskQuestion[],
+): string | null {
+  if (response.behavior !== "allow") return null;
+  const answers = response.updatedInput?.answers;
+  if (!answers || typeof answers !== "object" || Array.isArray(answers))
+    return null;
+  const parts = questions
+    .map((question, index) => {
+      const header =
+        questions.length === 1 ? "Response" : `Question ${index + 1}`;
+      const value = answers[header];
+      if (typeof value === "string") return value.trim();
+      if (Array.isArray(value))
+        return value
+          .filter((entry): entry is string => typeof entry === "string")
+          .join(", ");
+      return "";
+    })
+    .filter((part) => part.length > 0);
+  return parts.length ? parts.join("\n") : null;
+}
+
 function isPotentialTerminatedBanner(text: string): boolean {
   const trimmedStart = text.trimStart();
   if (trimmedStart.length === 0) return true;
@@ -3041,4 +3211,33 @@ function toAcpMcpServers(
       })),
     };
   });
+}
+
+function extractBackgroundTaskId(state: AcpToolCallState): string | undefined {
+  for (const candidate of [state.rawOutput, state.textContent]) {
+    if (typeof candidate !== "string") continue;
+    const match =
+      /Tool is running as a background task with task id:\s*([\w-]+\/task-\d+)/.exec(
+        candidate,
+      );
+    if (match?.[1]) return match[1];
+  }
+  return undefined;
+}
+
+function matchesBackgroundTaskTool(
+  task: BackgroundTask,
+  state: AcpToolCallState,
+): boolean {
+  const input = state.rawInput;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return false;
+  }
+  if (task.toolName === "schedule") {
+    return (
+      state.name === "schedule" &&
+      (input.Prompt === task.prompt || input.Prompt === task.command)
+    );
+  }
+  return state.name === "run_command" && input.CommandLine === task.command;
 }
